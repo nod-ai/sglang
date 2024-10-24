@@ -128,7 +128,9 @@ def http_request(
         headers["Authorization"] = f"Bearer {api_key}"
 
     if stream:
-        return requests.post(url, json=json, stream=True, headers=headers)
+        return requests.post(
+            url, json=json, stream=True, headers=headers,
+        )
     else:
         req = urllib.request.Request(url, headers=headers, method=method)
         if json is None:
@@ -137,7 +139,9 @@ def http_request(
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            resp = urllib.request.urlopen(
+                req, data=data, cafile=verify,
+            )
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)
