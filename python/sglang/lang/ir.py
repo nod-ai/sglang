@@ -252,7 +252,6 @@ class SglFunction:
         backend=None,
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
-        generator_style: bool = False,
     ):
         from sglang.lang.interpreter import run_program_batch
 
@@ -304,7 +303,6 @@ class SglFunction:
             default_sampling_para,
             num_threads,
             progress_bar,
-            generator_style=generator_style,
         )
 
     def trace(self, *, backend=None, **kwargs):
