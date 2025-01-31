@@ -124,7 +124,7 @@ class SglSamplingParams:
             else False
         )
         kwargs["sampling_params"] = {
-            "max_completion_tokens": 10,
+            "max_completion_tokens": self.max_new_tokens,
             "temperature": self.temperature,
         }
         return kwargs
@@ -244,7 +244,6 @@ class SglFunction:
         backend=None,
         num_threads: Union[str, int] = "auto",
         progress_bar: bool = False,
-        generator_style: bool = False,
     ):
         from sglang.lang.interpreter import run_program_batch
 
@@ -295,7 +294,6 @@ class SglFunction:
             default_sampling_para,
             num_threads,
             progress_bar,
-            generator_style=generator_style,
         )
 
     def trace(self, *, backend=None, **kwargs):
