@@ -347,32 +347,23 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if _is_hip:
+    if is_hip_:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
 
     else:
-        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
+        if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
-            # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (64, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 32)
+        elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
+            if Lq <= 128:
+                BLOCK_M, BLOCK_N = (128, 128)
+            elif Lq <= 256:
+                BLOCK_M, BLOCK_N = (64, 64)
             else:
-                if Lq <= 128:
-                    BLOCK_M, BLOCK_N = (128, 128)
-                elif Lq <= 256:
-                    BLOCK_M, BLOCK_N = (64, 64)
-                else:
-                    BLOCK_M, BLOCK_N = (32, 64)
+                BLOCK_M, BLOCK_N = (32, 64)
         else:
             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
 

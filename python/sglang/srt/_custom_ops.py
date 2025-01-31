@@ -1,19 +1,20 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/_custom_ops.py
+import contextlib
+import functools
+import importlib
 import logging
-from typing import List, Tuple
+import os
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.utils import get_bool_env_var, is_hip, is_hpu
 
 logger = logging.getLogger(__name__)
-use_vllm_custom_allreduce = get_bool_env_var(
-    "USE_VLLM_CUSTOM_ALLREDUCE", default="false"
-)
+use_vllm_custom_allreduce = os.environ.get("USE_VLLM_CUSTOM_ALLREDUCE", default=True)
 
 if not is_hpu():
-    # ROCm does not use vllm custom allreduce
-    if use_vllm_custom_allreduce and not is_hip():
+    if use_vllm_custom_allreduce:
         try:
             import vllm._C
         except ImportError as e:
@@ -25,20 +26,32 @@ if not is_hpu():
             logger.warning("Failed to import from custom_ar with %r", e)
 
 
-if not is_hip():
-    if use_vllm_custom_allreduce:
-        custom_op = torch.ops._C_custom_ar
-    else:
-        custom_op = sgl_kernel.allreduce
+def hint_on_error(fn):
 
-    # custom allreduce
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            import vllm._C
+        except ImportError as e:
+            logger.warning("Failed to import from vllm._C with %r", e)
+    else:
+        try:
+            import sgl_kernel
+        except ImportError as e:
+            logger.warning("Failed to import from custom_ar with %r", e)
+
+
+if use_vllm_custom_allreduce:
+    # custom ar
     def init_custom_ar(
         ipc_tensors: List[torch.Tensor],
         rank_data: torch.Tensor,
         rank: int,
         full_nvlink: bool,
     ) -> int:
-        return custom_op.init_custom_ar(ipc_tensors, rank_data, rank, full_nvlink)
+        return torch.ops._C_custom_ar.init_custom_ar(
+            ipc_tensors, rank_data, rank, full_nvlink
+        )
 
     def all_reduce(
         fa: int,
@@ -47,38 +60,79 @@ if not is_hip():
         reg_buffer: int,
         reg_buffer_sz_bytes: int,
     ) -> None:
-        custom_op.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+        torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
     def dispose(fa: int) -> None:
-        custom_op.dispose(fa)
+        torch.ops._C_custom_ar.dispose(fa)
 
     def meta_size() -> int:
-        return custom_op.meta_size()
+        return torch.ops._C_custom_ar.meta_size()
 
     def register_buffer(fa: int, ipc_tensors: List[int]) -> None:
-        return custom_op.register_buffer(fa, ipc_tensors)
+        return torch.ops._C_custom_ar.register_buffer(fa, ipc_tensors)
 
     def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
-        return custom_op.get_graph_buffer_ipc_meta(fa)
+        return torch.ops._C_custom_ar.get_graph_buffer_ipc_meta(fa)
 
     def register_graph_buffers(
         fa: int, handles: List[List[int]], offsets: List[List[int]]
     ) -> None:
-        custom_op.register_graph_buffers(fa, handles, offsets)
+        torch.ops._C_custom_ar.register_graph_buffers(fa, handles, offsets)
 
 else:
-    # ROCM custom allreduce
-
+    # custom ar
     def init_custom_ar(
-        meta: torch.Tensor,
-        rank_data: torch.Tensor,
-        handles: List[str],
-        offsets: List[int],
-        rank: int,
-        full_nvlink: bool,
+        rank_id: int,
+        world_size: int,
+        rank_data_base: torch.Tensor,
+        buffers: List[int],
+        tmp_result_buffers: List[int],
+        barrier_in: List[int],
+        barrier_out: List[int],
     ) -> int:
-        return sgl_kernel.allreduce.init_custom_ar(
-            meta, rank_data, handles, offsets, rank, full_nvlink
+        return sgl_kernel.ops.init_custom_reduce(
+            rank_id,
+            world_size,
+            rank_data_base,
+            buffers,
+            tmp_result_buffers,
+            barrier_in,
+            barrier_out,
+        )
+
+    def all_reduce(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
+        sgl_kernel.ops.custom_reduce(fa, inp, out)
+
+    def dispose(fa: int) -> None:
+        sgl_kernel.ops.custom_dispose(fa)
+
+    def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
+        return sgl_kernel.ops.get_graph_buffer_ipc_meta(fa)
+
+    def register_graph_buffers(
+        fa: int, handles: List[List[int]], offsets: List[List[int]]
+    ) -> None:
+        sgl_kernel.ops.register_graph_buffers(fa, handles, offsets)
+
+
+# temporary fix for https://github.com/vllm-project/vllm/issues/5456
+# TODO: remove this in v0.6.0
+names_and_values = globals()
+names_and_values_to_update = {}
+# prepare variables to avoid dict size change during iteration
+k, v, arg = None, None, None
+fn_type = type(lambda x: x)
+for k, v in names_and_values.items():
+    # find functions that are defined in this file and have torch.Tensor
+    # in their annotations. `arg == "torch.Tensor"` is used to handle
+    # the case when users use `import __annotations__` to turn type
+    # hints into strings.
+    if (
+        isinstance(v, fn_type)
+        and v.__code__.co_filename == __file__
+        and any(
+            arg is torch.Tensor or arg == "torch.Tensor"
+            for arg in v.__annotations__.values()
         )
 
     def all_reduce_reg(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:

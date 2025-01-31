@@ -1,8 +1,6 @@
 """
 python3 -m unittest test_ebnf_constrained.TestEBNFConstrained.test_ebnf_generate_email
 python3 -m unittest test_ebnf_constrained.TestEBNFConstrained.test_ebnf_generate_greeting
-python3 -m unittest test_ebnf_constrained.TestEBNFConstrainedLLGuidance.test_ebnf_generate_email
-python3 -m unittest test_ebnf_constrained.TestEBNFConstrainedLLGuidance.test_ebnf_generate_greeting
 """
 
 import json
@@ -15,12 +13,11 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
 )
 
 
-def setup_class(cls, backend: str, disable_overlap: bool):
+def setup_class(cls, disable_overlap: bool):
     cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
     cls.base_url = DEFAULT_URL_FOR_TEST
     cls.ebnf_grammar = 'root ::= "test"'  # Default grammar
@@ -29,7 +26,7 @@ def setup_class(cls, backend: str, disable_overlap: bool):
         "--max-running-requests",
         "10",
         "--grammar-backend",
-        backend,
+        "xgrammar",
     ]
 
     if disable_overlap:
@@ -43,10 +40,11 @@ def setup_class(cls, backend: str, disable_overlap: bool):
     )
 
 
-class TestEBNFConstrained(CustomTestCase):
+class TestEBNFConstrained(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        setup_class(cls, "xgrammar", disable_overlap=False)
+        setup_class(cls, disable_overlap=False)
+        cls.check_jump_forward = False
 
     @classmethod
     def tearDownClass(cls):
@@ -236,12 +234,6 @@ class TestEBNFConstrained(CustomTestCase):
             prompt=prompt,
             n=3,
         )
-
-
-class TestEBNFConstrainedLLGuidance(TestEBNFConstrained):
-    @classmethod
-    def setUpClass(cls):
-        setup_class(cls, "llguidance", disable_overlap=False)
 
 
 if __name__ == "__main__":

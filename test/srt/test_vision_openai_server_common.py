@@ -177,15 +177,9 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.choices[0].message.role == "assistant"
         text = response.choices[0].message.content
         assert isinstance(text, str)
-        print("-" * 30)
-        print(f"Multi images response:\n{text}")
-        print("-" * 30)
-        assert (
-            "man" in text or "cab" in text or "SUV" in text or "taxi" in text
-        ), f"text: {text}, should contain man, cab, SUV or taxi"
-        assert (
-            "logo" in text or '"S"' in text or "SG" in text
-        ), f"text: {text}, should contain logo, S or SG"
+        print(text)
+        assert "man" in text or "cab" in text or "SUV" in text or "taxi" in text, text
+        assert "logo" in text or '"S"' in text or "SG" in text, text
         assert response.id
         assert response.created
         assert response.usage.prompt_tokens > 0
@@ -195,14 +189,7 @@ class TestOpenAIVisionServer(CustomTestCase):
     def prepare_video_messages(self, video_path):
         # the memory consumed by the Vision Attention varies a lot, e.g. blocked qkv vs full-sequence sdpa
         # the size of the video embeds differs from the `modality` argument when preprocessed
-
-        # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
-        # The following import order will cause Segmentation fault.
-        # import decord
-        # from transformers import AutoTokenizer
-        from decord import VideoReader, cpu
-
-        max_frames_num = 20
+        max_frames_num = 12
         vr = VideoReader(video_path, ctx=cpu(0))
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(
@@ -424,15 +411,33 @@ class TestOpenAIVisionServer(CustomTestCase):
 
         messages = self.prepare_audio_messages(prompt, audio_file_path)
 
-        response = client.chat.completions.create(
-            model="default",
-            messages=messages,
-            temperature=0,
-            max_tokens=128,
-            stream=False,
-        )
+        with self.assertRaises(openai.BadRequestError) as cm:
+            client.chat.completions.create(
+                model="default",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": "Give a lengthy description of this picture",
+                            },
+                        ],
+                    },
+                ],
+                temperature=0,
+            )
 
-        audio_response = response.choices[0].message.content
+        self.assertIn(
+            "Multimodal prompt is too long after expanding multimodal tokens.",
+            str(cm.exception),
+        )
 
         print("-" * 30)
         print(f"audio {category} response:\n{audio_response}")
@@ -469,3 +474,26 @@ class TestOpenAIVisionServer(CustomTestCase):
 
     def test_audio_chat_completion(self):
         pass
+
+
+class TestMinicpmvServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "openbmb/MiniCPM-V-2_6"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--chat-template",
+                "minicpmv",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
+if __name__ == "__main__":
+    unittest.main()

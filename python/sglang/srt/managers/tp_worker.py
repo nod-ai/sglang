@@ -56,8 +56,6 @@ class TpModelWorker:
         dp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
-        req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -65,14 +63,19 @@ class TpModelWorker:
         self.pp_rank = pp_rank
 
         # Init model and tokenizer
-        self.model_config = ModelConfig.from_server_args(
-            server_args,
-            model_path=(
+        self.model_config = ModelConfig(
+            (
                 server_args.model_path
                 if not is_draft_worker
                 else server_args.speculative_draft_model_path
             ),
-            is_draft_model=is_draft_worker,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            context_length=server_args.context_length,
+            model_override_args=server_args.json_model_override_args,
+            is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
         )
 
         self.model_runner = ModelRunner(
@@ -86,8 +89,6 @@ class TpModelWorker:
             nccl_port=nccl_port,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -174,6 +175,9 @@ class TpModelWorker:
     def get_attention_tp_cpu_group(self):
         return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
 
+    def get_attention_tp_cpu_group(self):
+        return self.model_runner.attention_tp_group.cpu_group
+
     def get_memory_pool(self):
         return (
             self.model_runner.req_to_token_pool,
@@ -185,40 +189,18 @@ class TpModelWorker:
         model_worker_batch: ModelWorkerBatch,
         launch_done: Optional[threading.Event] = None,
         skip_sample: bool = False,
-    ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
-    ]:
+    ):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        logits_output = self.model_runner.forward(forward_batch)
+        if launch_done:
+            launch_done.set()
 
-        pp_proxy_tensors = None
-        if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(
-                    all_gather_group=self.get_attention_tp_group()
-                )
-            )
-
-        if self.pp_group.is_last_rank:
-            logits_output, can_run_cuda_graph = self.model_runner.forward(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
-            )
-            if launch_done is not None:
-                launch_done.set()
-
-            if skip_sample:
-                next_token_ids = None
-            else:
-                next_token_ids = self.model_runner.sample(
-                    logits_output, model_worker_batch
-                )
-
-            return logits_output, next_token_ids, can_run_cuda_graph
+        if skip_sample:
+            next_token_ids = None
         else:
-            pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-            return pp_proxy_tensors.tensors, None, can_run_cuda_graph
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+
+        return logits_output, next_token_ids
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
@@ -253,10 +235,7 @@ class TpModelWorker:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            ),
-            load_format=recv_req.load_format,
+            MultiprocessingSerializer.deserialize(recv_req.serialized_named_tensors)
         )
         return success, message
 

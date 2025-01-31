@@ -30,11 +30,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers import Qwen2VLConfig
-from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+from vllm.model_executor.layers.activation import QuickGELU
 
 from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -50,6 +48,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -139,22 +139,22 @@ class Qwen2VisionBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         if attn_implementation == "sdpa":
-            qkv_backend = "sdpa"
-            softmax_in_single_precision = False
+            use_context_forward = False
+            use_full_precision_softmax = False
         elif attn_implementation == "flash_attention_2":
-            qkv_backend = "triton_attn"
-            softmax_in_single_precision = False
+            use_full_precision_softmax = False
+            use_context_forward = True
         elif attn_implementation == "eager":
-            qkv_backend = "sdpa"
-            softmax_in_single_precision = True
+            use_full_precision_softmax = True
+            use_context_forward = False
 
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
             projection_size=dim,
-            use_qkv_parallel=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
+            use_qkv_parallel=False,
+            use_context_forward=use_context_forward,
+            use_full_precision_softmax=use_full_precision_softmax,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -176,9 +176,7 @@ class Qwen2VisionBlock(nn.Module):
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
         attn = self.attn(
-            hidden_states,
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
+            hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -537,7 +535,51 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
-        hidden_states = general_mm_embed_routine(
+
+            # Clamp input ids. This is because the input_ids for the image tokens are
+            # filled with the hash values of the image for the prefix matching in the radix attention.
+            # There values are useless because their embeddings will be replaced by vision embeddings anyway.
+            input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
+
+            inputs_embeds = self.model.embed_tokens(input_ids)
+            extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+            prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+            for i, image in enumerate(forward_batch.image_inputs):
+                if image is None:
+                    continue
+                start_idx = extend_start_loc_cpu[i]
+                prefix_len = prefix_lens_cpu[i]
+
+                pixel_values = torch.tensor(image.pixel_values, device="cuda")
+                image_grid_thws = torch.tensor(
+                    np.array(image.image_grid_thws), device="cuda"
+                )
+                image_offsets = image.image_offsets
+                image_input = Qwen2VLImageInputs(
+                    pixel_values=pixel_values, image_grid_thw=image_grid_thws
+                )
+                image_embeds = self._process_image_input(image_input)
+
+                image_embeds_offset = 0
+                for idx, image_offset in enumerate(image_offsets):
+                    if image_offset < prefix_len:
+                        continue
+                    num_image_tokens = self.calculate_num_image_tokens(
+                        image_grid_thws[idx]
+                    )
+
+                    left_idx = start_idx + (image_offset - prefix_len)
+                    right_idx = (
+                        start_idx + (image_offset - prefix_len) + num_image_tokens
+                    )
+
+                    inputs_embeds[left_idx:right_idx] = image_embeds[
+                        image_embeds_offset : image_embeds_offset + num_image_tokens
+                    ]
+                    image_embeds_offset += num_image_tokens
+
+        input_ids = None
+        hidden_states = self.model(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.model,
@@ -565,8 +607,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -581,6 +621,24 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+
+                if "visual" in name and "qkv.weight" in name:
+                    visual_num_heads = self.config.vision_config.num_heads
+                    visual_embed_dim = self.config.vision_config.embed_dim
+                    head_size = visual_embed_dim // visual_num_heads
+                    loaded_weight = loaded_weight.view(
+                        3, visual_num_heads, head_size, visual_embed_dim
+                    )
+                    loaded_weight = loaded_weight.transpose(0, 1)
+                    loaded_weight = loaded_weight.reshape(-1, visual_embed_dim)
+                elif "visual" in name and "qkv.bias" in name:
+                    visual_num_heads = self.config.vision_config.num_heads
+                    visual_embed_dim = self.config.vision_config.embed_dim
+                    head_size = visual_embed_dim // visual_num_heads
+                    loaded_weight = loaded_weight.view(3, visual_num_heads, head_size)
+                    loaded_weight = loaded_weight.transpose(0, 1)
+                    loaded_weight = loaded_weight.reshape(-1)
+
                 if "visual" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")

@@ -1,5 +1,6 @@
 import itertools
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -234,7 +235,7 @@ class MiniMaxText01LightningAttention(nn.Module):
                 "... n e, ... e d -> ... n d", q[:, :, i : i + 1], kv.to(q.dtype)
             )
             output.append(qkv)
-        output = torch.cat(output, dim=-2)
+        output = torch.concat(output, dim=-2)
 
         # reshape
         output = rearrange(output, "b h n d -> b n (h d)")

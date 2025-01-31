@@ -65,7 +65,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
+from sglang.srt.utils import get_compiler_backend, set_weight_attrs
 
 
 @torch.compile(backend=get_compiler_backend())

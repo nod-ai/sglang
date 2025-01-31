@@ -138,13 +138,7 @@ class SchedulerStats:
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
     cache_hit_rate: float = 0.0
-    num_grammar_queue_reqs: int = 0
     spec_accept_length: float = 0.0
-    avg_request_queue_latency: float = 0.0
-    num_prefill_prealloc_queue_reqs: int = 0
-    num_prefill_infight_queue_reqs: int = 0
-    num_decode_prealloc_queue_reqs: int = 0
-    num_decode_transfer_queue_reqs: int = 0
 
 
 class SchedulerMetricsCollector:
@@ -201,6 +195,13 @@ class SchedulerMetricsCollector:
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.spec_accept_length = Gauge(
+            name="sglang:spec_accept_length",
+            documentation="The average acceptance length of speculative decoding.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -280,22 +281,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
 
-        # Disaggregation metrics
-        self._log_gauge(
-            self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
-        )
-        self._log_gauge(
-            self.num_prefill_infight_queue_reqs, stats.num_prefill_infight_queue_reqs
-        )
-        self._log_gauge(
-            self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
-        )
-        self._log_gauge(
-            self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
-        )
-
-        self.last_log_time = time.perf_counter()
-
 
 class TokenizerMetricsCollector:
     def __init__(
@@ -324,167 +309,32 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
-        if collect_tokens_histogram:
-            bucket_prompt_tokens = [
-                100,
-                300,
-                500,
-                700,
-                1000,
-                1500,
-                2000,
-                3000,
-                4000,
-                5000,
-                6000,
-                7000,
-                8000,
-                9000,
-                10000,
-                12000,
-                15000,
-                20000,
-                22000,
-                25000,
-                30000,
-                35000,
-                40000,
-            ]
-            self.prompt_tokens_histogram = Histogram(
-                name="sglang:prompt_tokens_histogram",
-                documentation="Histogram of prompt token length.",
-                labelnames=labels.keys(),
-                buckets=bucket_prompt_tokens,
-            )
-            bucket_generation_tokens = [
-                100,
-                300,
-                500,
-                1000,
-                1200,
-                1500,
-                1700,
-                2000,
-                2500,
-                3000,
-                3500,
-                4000,
-                4500,
-                5000,
-                6000,
-                7000,
-                8000,
-                9000,
-                10000,
-            ]
-            self.generation_tokens_histogram = Histogram(
-                name="sglang:generation_tokens_histogram",
-                documentation="Histogram of generation token length.",
-                labelnames=labels.keys(),
-                buckets=bucket_generation_tokens,
-            )
-
-        self.cached_tokens_total = Counter(
-            name="sglang:cached_tokens_total",
-            documentation="Number of cached prompt tokens.",
-            labelnames=labels.keys(),
-        )
-
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
             labelnames=labels.keys(),
         )
 
-        self.num_so_requests_total = Counter(
-            name="sglang:num_so_requests_total",
-            documentation="Number of structured output requests processed.",
-            labelnames=labels.keys(),
-        )
-
-        self.num_aborted_requests_total = Counter(
-            name="sglang:num_aborted_requests",
-            documentation="Number of requests aborted.",
-            labelnames=labels.keys(),
-        )
-
-        if bucket_time_to_first_token is None:
-            bucket_time_to_first_token = [
-                0.1,
-                0.2,
-                0.4,
-                0.6,
-                0.8,
-                1,
-                2,
-                4,
-                6,
-                8,
-                10,
-                20,
-                40,
-                60,
-                80,
-                100,
-                200,
-                400,
-            ]
-
-        if bucket_e2e_request_latency is None:
-            bucket_e2e_request_latency = [
-                0.1,
-                0.2,
-                0.4,
-                0.6,
-                0.8,
-                1,
-                2,
-                4,
-                6,
-                8,
-                10,
-                20,
-                40,
-                60,
-                80,
-                100,
-                200,
-                400,
-                800,
-            ]
-
-        if bucket_inter_token_latency is None:
-            bucket_inter_token_latency = [
-                0.002,
-                0.004,
-                0.006,
-                0.008,
-                0.010,
-                0.015,
-                0.020,
-                0.025,
-                0.030,
-                0.035,
-                0.040,
-                0.060,
-                0.080,
-                0.100,
-                0.200,
-                0.400,
-                0.600,
-                0.800,
-                1.000,
-                2.000,
-                4.000,
-                6.000,
-                8.000,
-            ]
-
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
             labelnames=labels.keys(),
-            buckets=bucket_time_to_first_token,
+            buckets=[
+                0.1,
+                0.25,
+                0.5,
+                0.75,
+                1,
+                2,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
+                160,
+            ],
         )
 
         self.histogram_inter_token_latency_seconds = Histogram(
@@ -498,7 +348,21 @@ class TokenizerMetricsCollector:
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
             labelnames=labels.keys(),
-            buckets=bucket_e2e_request_latency,
+            buckets=[
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2,
+                5,
+                10,
+                20,
+                40,
+                60,
+                80,
+                120,
+                160,
+            ],
         )
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
@@ -524,11 +388,10 @@ class TokenizerMetricsCollector:
             self._log_histogram(self.prompt_tokens_histogram, prompt_tokens)
             self._log_histogram(self.generation_tokens_histogram, generation_tokens)
 
-    def observe_time_to_first_token(self, value: float):
-        self.histogram_time_to_first_token.labels(**self.labels).observe(value)
-
-    def observe_inter_token_latency(self, internval: float, num_new_tokens: int):
-        adjusted_interval = internval / num_new_tokens
+    def observe_one_finished_request(self, prompt_tokens: int, generation_tokens: int):
+        self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
+        self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
+        self.num_requests_total.labels(**self.labels).inc(1)
 
         # A faster version of the Histogram::observe which observes multiple values at the same time.
         # reference: https://github.com/prometheus/client_python/blob/v0.21.1/prometheus_client/metrics.py#L639

@@ -22,8 +22,6 @@ from typing import Tuple
 
 import requests
 
-from sglang.bench_serving import get_tokenizer, sample_random_requests
-from sglang.profiler import run_profile
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree

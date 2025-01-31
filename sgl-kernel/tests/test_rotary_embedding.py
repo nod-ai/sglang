@@ -1,7 +1,9 @@
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pytest
 import torch
+import torch.nn as nn
 from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 
 
@@ -186,6 +188,9 @@ def test_correctness(
     query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
         pos_ids, query_flashinfer, key_flashinfer
     )
+
+    print(query_ref_out)
+    print(query_flashinfer_out)
 
     torch.testing.assert_close(
         query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2

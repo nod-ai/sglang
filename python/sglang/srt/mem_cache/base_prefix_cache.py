@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, List, Tuple
+from typing import Callable, List, Tuple
 
 
 class BasePrefixCache(ABC):
@@ -42,6 +42,10 @@ class BasePrefixCache(ABC):
 
     def protected_size(self):
         return 0
+
+    @abstractmethod
+    def protected_size(self):
+        raise NotImplementedError()
 
     def total_size(self):
         raise NotImplementedError()

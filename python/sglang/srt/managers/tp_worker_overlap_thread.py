@@ -103,6 +103,9 @@ class TpModelWorkerClient:
     def get_attention_tp_cpu_group(self):
         return self.worker.get_attention_tp_cpu_group()
 
+    def get_attention_tp_cpu_group(self):
+        return self.worker.get_attention_tp_cpu_group()
+
     def get_memory_pool(self):
         return (
             self.worker.model_runner.req_to_token_pool,
@@ -168,10 +171,6 @@ class TpModelWorkerClient:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                     )
-            if logits_output.hidden_states is not None:
-                logits_output.hidden_states = logits_output.hidden_states.to(
-                    "cpu", non_blocking=True
-                )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
 

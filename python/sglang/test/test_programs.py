@@ -514,13 +514,13 @@ def test_hellaswag_select():
     preds = []
     for i, ret in enumerate(rets):
         preds.append(choices[i].index(ret["answer"]))
-    latency = time.perf_counter() - tic
+    latency = time.time() - tic
 
     # Compute accuracy
     accuracy = np.mean(np.array(preds) == np.array(labels))
 
     # Test generator style of run_batch
-    tic = time.perf_counter()
+    tic = time.time()
     rets = few_shot_hellaswag.run_batch(
         arguments,
         temperature=0,
@@ -531,12 +531,12 @@ def test_hellaswag_select():
     preds_gen = []
     for i, ret in enumerate(rets):
         preds_gen.append(choices[i].index(ret["answer"]))
-    latency_gen = time.perf_counter() - tic
+    latency_gen = time.time() - tic
 
     # Compute accuracy
     accuracy_gen = np.mean(np.array(preds_gen) == np.array(labels))
     print(f"{accuracy=}, {accuracy_gen=}")
-    assert np.abs(accuracy_gen - accuracy) < 0.1
+    assert np.abs(accuracy_gen - accuracy) < 0.05
     assert np.abs(latency_gen - latency) < 1
 
     return accuracy, latency

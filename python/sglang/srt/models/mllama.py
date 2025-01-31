@@ -201,16 +201,13 @@ class MllamaVisionEncoderLayer(nn.Module):
             self.num_attention_heads,
             self.hidden_size,
             use_qkv_parallel=True,
-            quant_config=quant_config,
+            quant_config=None,
             dropout=0.0,
-            qkv_backend="sdpa",
-            softmax_in_single_precision=False,
+            use_context_forward=False,
+            use_full_precision_softmax=False,
             flatten_batch=False,
-            prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = MllamaVisionMLP(
-            config, quant_config, prefix=add_prefix("mlp", prefix)
-        )
+        self.mlp = MllamaVisionMLP(config)
 
         self.input_layernorm = nn.LayerNorm(self.hidden_size, eps=config.norm_eps)
         self.post_attention_layernorm = nn.LayerNorm(

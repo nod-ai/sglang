@@ -22,8 +22,7 @@ The radix tree data structure for managing the KV cache.
 import heapq
 import time
 from collections import defaultdict
-from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -52,6 +51,23 @@ class TreeNode:
         self.value = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
+
+        self.hit_count = 0
+        # indicating the node is loading KV cache from host
+        self.loading = False
+        # store the host indices of KV cache
+        self.host_value = None
+
+        self.id = TreeNode.counter if id is None else id
+        TreeNode.counter += 1
+
+    @property
+    def evicted(self):
+        return self.value is None
+
+    @property
+    def backuped(self):
+        return self.host_value is not None
 
         self.hit_count = 0
         # indicating the node is loading KV cache from host
@@ -133,7 +149,6 @@ class RadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
-        self._record_all_cleared_event()
 
     def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
         """Find the matching prefix from the radix tree.
@@ -146,15 +161,8 @@ class RadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
-        if self.disable or len(key) == 0:
-            return (
-                torch.empty(
-                    (0,),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                self.root_node,
-            )
+        if self.disable:
+            return [], self.root_node
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
@@ -320,17 +328,6 @@ class RadixCache(BasePrefixCache):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
 
-    def all_values_flatten(self):
-        values = []
-
-        def _dfs_helper(node: TreeNode):
-            for _, child in node.children.items():
-                values.append(child.value)
-                _dfs_helper(child)
-
-        _dfs_helper(self.root_node)
-        return torch.cat(values)
-
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
@@ -435,17 +432,13 @@ class RadixCache(BasePrefixCache):
         del node.parent.children[k]
         self.evictable_size_ -= len(node.key)
 
-    def _total_size_helper(self):
-        total_size = 0
-        stack = [self.root_node]
-        while stack:
-            current_node = stack.pop()
-            total_size += len(current_node.value)
-            for child in current_node.children.values():
-                if child.evicted:
-                    continue
-                stack.append(child)
-        return total_size
+    def _total_size_helper(self, node: TreeNode):
+        if node.evicted:
+            return 0
+        x = len(node.value)
+        for child in node.children.values():
+            x += self._total_size_helper(child)
+        return x
 
     def _collect_leaves(self):
         ret_list = []

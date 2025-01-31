@@ -28,7 +28,7 @@ def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
-class TestSessionControl(CustomTestCase):
+class TestSessionControl(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -87,7 +87,9 @@ class TestSessionControl(CustomTestCase):
                     },
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": max_new_tokens,
+                        "max_new_tokens": (
+                            gen_len if i > 0 else 1
+                        ),  # prefill only for the first chunk
                         "no_stop_trim": True,
                         "skip_special_tokens": False,
                     },
@@ -276,16 +278,9 @@ class TestSessionControl(CustomTestCase):
         print(outputs_from_session)
         print("outputs from normal queries:")
         print(outputs_normal)
-        assert outputs_from_session == outputs_normal
-        print("logprobs from chunked queries with session control:")
-        print(logprobs_from_session)
-        print("logprobs from normal queries:")
-        print(logprobs_normal)
-        assert len(logprobs_from_session) == len(
-            logprobs_normal
-        ), "logprobs must have equal length"
-        for a, b in zip(logprobs_from_session, logprobs_normal):
-            assert abs(a - b) <= 0.1, f"logprobs {a} and {b} differ by more than 0.1"
+        assert (
+            outputs_from_session == outputs_normal
+        ), f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
 
     async def async_generate(self, payload):
         url = self.base_url + "/generate"

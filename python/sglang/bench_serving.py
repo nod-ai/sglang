@@ -591,7 +591,6 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
             context_len=args.sharegpt_context_len,
-            prompt_suffix=args.prompt_suffix,
             apply_chat_template=args.apply_chat_template,
         )
     elif args.dataset_name.startswith("random"):
@@ -860,14 +859,13 @@ def sample_sharegpt_requests(
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
     context_len: Optional[int] = None,
-    prompt_suffix: Optional[str] = "",
     apply_chat_template=False,
-) -> List[DatasetRow]:
+) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
 
     # Download sharegpt if necessary
-    if not is_file_valid_json(dataset_path) and dataset_path == "":
+    if not os.path.isfile(dataset_path) and dataset_path == "":
         dataset_path = download_and_cache_file(SHAREGPT_URL)
 
     # Load the dataset.
@@ -900,12 +898,6 @@ def sample_sharegpt_requests(
 
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
-        if prompt_suffix:
-            prompt = (
-                remove_suffix(prompt, ASSISTANT_SUFFIX)
-                + prompt_suffix
-                + ASSISTANT_SUFFIX
-            )
 
         if apply_chat_template:
             prompt = tokenizer.apply_chat_template(
@@ -930,6 +922,8 @@ def sample_sharegpt_requests(
         if context_len and prompt_len + output_len > context_len:
             # Prune too long sequences.
             continue
+
+        filtered_dataset.append((prompt, prompt_len, output_len))
 
         filtered_dataset.append(
             DatasetRow(prompt=prompt, prompt_len=prompt_len, output_len=output_len)
@@ -1273,30 +1267,8 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
-    print(f"Starting warmup with {warmup_requests} sequences...")
-
-    # Use the first request for all warmup iterations
-    test_request = input_requests[0]
-    test_prompt, test_prompt_len, test_output_len = (
-        test_request.prompt,
-        test_request.prompt_len,
-        test_request.output_len,
-    )
-    if lora_names is not None and len(lora_names) != 0:
-        lora_name = lora_names[0]
-    else:
-        lora_name = None
-
-    if "<image>" in test_prompt:
-        import re
-
-        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt, re.DOTALL)
-        image_data = image_match.group(1) if image_match else None
-        test_prompt = image_match.group(2) if image_match else test_prompt
-    else:
-        image_data = None
-
-    # Create the test input once
+    print("Starting initial single prompt test run...")
+    test_prompt, test_prompt_len, test_output_len = input_requests[0]
     test_input = RequestFuncInput(
         model=model_id,
         prompt=test_prompt,
@@ -1329,8 +1301,8 @@ async def benchmark(
         )
 
     # Flush cache
-    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
-        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+    if "sglang" in backend:
+        requests.post(base_url + "/flush_cache")
 
     time.sleep(1.0)
 
@@ -1396,20 +1368,6 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if "sglang" in backend:
-        server_info = requests.get(base_url + "/get_server_info")
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            accept_length = server_info_json["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
-        else:
-            accept_length = None
-    else:
-        accept_length = None
-
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
@@ -1459,8 +1417,6 @@ async def benchmark(
         )
     )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
-    if accept_length:
-        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1521,10 +1477,8 @@ async def benchmark(
             "mean_itl_ms": metrics.mean_itl_ms,
             "median_itl_ms": metrics.median_itl_ms,
             "std_itl_ms": metrics.std_itl_ms,
-            "p95_itl_ms": metrics.p95_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
-            "accept_length": accept_length,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -1540,14 +1494,21 @@ async def benchmark(
         else:
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_sharegpt.jsonl"
 
-    result_details = {
-        "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": output_lens,
-        "ttfts": [output.ttft for output in outputs],
-        "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
-    }
+    # Append results to a JSONL file
+    with open(output_file_name, "a") as file:
+        file.write(json.dumps(result) + "\n")
+
+    result.update(
+        {
+            "input_lens": [output.prompt_len for output in outputs],
+            "output_lens": output_lens,
+            "ttfts": [output.ttft for output in outputs],
+            "itls": [output.itl for output in outputs],
+            "generated_texts": [output.generated_text for output in outputs],
+            "errors": [output.error for output in outputs],
+        }
+    )
+    return result
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
@@ -1843,6 +1804,17 @@ if __name__ == "__main__":
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up.",
     )
+    parser.add_argument(
+        "--multi",
+        action="store_true",
+        help="Use request rate range rather than single value.",
+    )
+    parser.add_argument(
+        "--request-rate-range",
+        type=str,
+        default="2,34,2",
+        help="Range of request rates in the format start,stop,step. Default is 2,34,2. It also supports a list of request rates, requiring the parameters to not equal three.",
+    )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
         "--output-details", action="store_true", help="Output details of benchmarking."
@@ -1920,6 +1892,38 @@ if __name__ == "__main__":
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
+    )
+
+    group = parser.add_argument_group("generated-shared-prefix dataset arguments")
+    group.add_argument(
+        "--gsp-num-groups",
+        type=int,
+        default=64,
+        help="Number of system prompt groups for generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gsp-prompts-per-group",
+        type=int,
+        default=16,
+        help="Number of prompts per system prompt group for generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gsp-system-prompt-len",
+        type=int,
+        default=2048,
+        help="Target length in tokens for system prompts in generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gsp-question-len",
+        type=int,
+        default=128,
+        help="Target length in tokens for questions in generated-shared-prefix dataset",
+    )
+    group.add_argument(
+        "--gsp-output-len",
+        type=int,
+        default=256,
+        help="Target length in tokens for outputs in generated-shared-prefix dataset",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")

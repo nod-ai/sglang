@@ -157,7 +157,6 @@ class ModelConfig:
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
-            or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -236,28 +235,7 @@ class ModelConfig:
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
-
-        config = self.hf_config
-
-        # multimodal
-        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
-            config, "image_token_index", None
-        )
-
-    @staticmethod
-    def from_server_args(server_args: ServerArgs, model_path: str = None, **kwargs):
-        return ModelConfig(
-            model_path=model_path or server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=server_args.revision,
-            context_length=server_args.context_length,
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
-            quantization=server_args.quantization,
-            **kwargs,
-        )
+        self.image_token_id = getattr(self.hf_config, "image_token_id", None)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
@@ -363,14 +341,9 @@ class ModelConfig:
             "compressed-tensors",
             "experts_int8",
             "w8a8_int8",
-            "w8a8_fp8",
-            "moe_wna16",
-            "qoq",
         ]
         compatible_quantization_methods = {
-            "modelopt_fp4": ["modelopt"],
-            "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
-            "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
+            "w8a8_int8": ["compressed-tensors", "compressed_tensors"]
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -573,9 +546,14 @@ multimodal_model_archs = [
 
 
 def is_multimodal_model(model_architectures: List[str]):
-    if any(
-        multi_model_arch in model_architectures
-        for multi_model_arch in multimodal_model_archs
+    if (
+        "LlavaLlamaForCausalLM" in model_architectures
+        or "LlavaQwenForCausalLM" in model_architectures
+        or "LlavaMistralForCausalLM" in model_architectures
+        or "LlavaVidForCausalLM" in model_architectures
+        or "MllamaForConditionalGeneration" in model_architectures
+        or "Qwen2VLForConditionalGeneration" in model_architectures
+        or "MiniCPMV" in model_architectures
     ):
         return True
     else:

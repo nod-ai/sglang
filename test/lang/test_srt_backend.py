@@ -76,7 +76,7 @@ class TestSRTBackend(CustomTestCase):
         # Run twice to capture more bugs
         for _ in range(2):
             accuracy, latency = test_hellaswag_select()
-            self.assertGreater(accuracy, 0.60)
+            self.assertGreater(accuracy, 0.70)
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()

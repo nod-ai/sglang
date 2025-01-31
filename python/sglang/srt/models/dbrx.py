@@ -46,7 +46,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.utils import set_weight_attrs
 
 
 class DbrxRouter(nn.Module):

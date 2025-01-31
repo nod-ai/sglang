@@ -39,6 +39,13 @@ logger.warning(
 
 _MIN_BLOCK_KV = 32
 
+logger = logging.getLogger(__name__)
+
+# TODO: Remove this when triton>=3.2.0. This issue will not affect performance and accuracy.
+logger.warning(
+    "The following error message 'operation scheduled before its operands' can be ignored."
+)
+
 
 @triton.jit
 def tanh(x):
@@ -52,8 +59,9 @@ def _fwd_kernel_stage1(
     K_Buffer,
     V_Buffer,
     sm_scale,
-    kv_indptr,
-    kv_indices,
+    Req_to_tokens,
+    B_req_idx,
+    B_Seqlen,
     Att_Out,
     Att_Lse,
     num_kv_splits,
@@ -70,7 +78,7 @@ def _fwd_kernel_stage1(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    MIN_BLOCK_KV: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
@@ -85,16 +93,13 @@ def _fwd_kernel_stage1(
     offs_dv = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lk
     mask_dv = offs_dv < Lv
-
-    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
-    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+    q = tl.load(Q + off_q, mask=mask_d, other=0.0)
 
-    kv_len_per_split = (
-        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
-    )
+    kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -103,11 +108,10 @@ def _fwd_kernel_stage1(
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
-        q = tl.load(Q + off_q, mask=mask_d, other=0.0)
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
+                Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n,
                 mask=offs_n < split_kv_end,
                 other=0,
             )
@@ -166,10 +170,11 @@ def _fwd_kernel_stage1(
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
-        ) // Lv
+            + Lv
+        )
 
         tl.store(
-            Att_Lse + offs_mid_o_1,
+            Att_Out + offs_mid_o_1,
             e_max + tl.log(e_sum),
         )
 
@@ -179,25 +184,21 @@ def _decode_att_m_fwd(
     k_buffer,
     v_buffer,
     att_out,
-    att_lse,
-    kv_indptr,
-    kv_indices,
+    Req_to_tokens,
+    B_req_idx,
+    B_Seqlen,
     num_kv_splits,
-    max_kv_splits,
     sm_scale,
     logit_cap,
 ):
     BLOCK = 64
-    # [TODO] work around SGPR limit on MI3xx
-    if _is_hip:
-        BLOCK = 8
-    MAX_KV_SPLITS = max_kv_splits
+    NUM_KV_SPLITS = num_kv_splits
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
     batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
 
-    grid = (batch, head_num, MAX_KV_SPLITS)
+    grid = (batch, head_num, NUM_KV_SPLITS)
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     if kv_group_num == 1:
@@ -215,8 +216,9 @@ def _decode_att_m_fwd(
         k_buffer,
         v_buffer,
         sm_scale,
-        kv_indptr,
-        kv_indices,
+        Req_to_tokens,
+        B_req_idx,
+        B_Seqlen,
         att_out,
         att_lse,
         num_kv_splits,
@@ -233,7 +235,7 @@ def _decode_att_m_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
-        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
         logit_cap=logit_cap,
         num_warps=num_warps,
         num_stages=2,
@@ -248,8 +250,9 @@ def _fwd_grouped_kernel_stage1(
     K_Buffer,
     V_Buffer,
     sm_scale,
-    kv_indptr,
-    kv_indices,
+    Req_to_tokens,
+    B_req_idx,
+    B_Seqlen,
     Att_Out,
     Att_Lse,
     num_kv_splits,
@@ -269,7 +272,7 @@ def _fwd_grouped_kernel_stage1(
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    MIN_BLOCK_KV: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
@@ -291,12 +294,11 @@ def _fwd_grouped_kernel_stage1(
     offs_dv = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lk
     mask_dv = offs_dv < Lv
-
-    cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
-    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
 
     offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+    q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
@@ -304,10 +306,11 @@ def _fwd_grouped_kernel_stage1(
         off_qpe = (
             cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
         )
+        qpe = tl.load(
+            Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
+        )
 
-    kv_len_per_split = (
-        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
-    )
+    kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -316,15 +319,10 @@ def _fwd_grouped_kernel_stage1(
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
-        q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        if BLOCK_DPE > 0:
-            qpe = tl.load(
-                Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
-            )
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
+                Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + offs_n,
                 mask=offs_n < split_kv_end,
                 other=0,
             )
@@ -397,10 +395,11 @@ def _fwd_grouped_kernel_stage1(
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
-        ) // Lv
+            + Lv
+        )
 
         tl.store(
-            Att_Lse + offs_mid_o_1,
+            Att_Out + offs_mid_o_1,
             e_max + tl.log(e_sum),
             mask=mask_h,
         )
@@ -411,11 +410,10 @@ def _decode_grouped_att_m_fwd(
     k_buffer,
     v_buffer,
     att_out,
-    att_lse,
-    kv_indptr,
-    kv_indices,
+    Req_to_tokens,
+    B_req_idx,
+    B_Seqlen,
     num_kv_splits,
-    max_kv_splits,
     sm_scale,
     logit_cap,
 ):
@@ -424,7 +422,7 @@ def _decode_grouped_att_m_fwd(
     Lv = v_buffer.shape[-1]
 
     # [TODO] work around shmem limit on MI3xx
-    if _is_hip and Lk >= 576:
+    if is_hip_ and Lk >= 576:
         BLOCK = 16
 
     if Lk == 576:
@@ -442,11 +440,11 @@ def _decode_grouped_att_m_fwd(
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     BLOCK_H = 16
-    MAX_KV_SPLITS = max_kv_splits
+    NUM_KV_SPLITS = num_kv_splits
     grid = (
         batch,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
-        MAX_KV_SPLITS,
+        NUM_KV_SPLITS,
     )
 
     extra_kargs = {}
@@ -462,8 +460,9 @@ def _decode_grouped_att_m_fwd(
         k_buffer,
         v_buffer,
         sm_scale,
-        kv_indptr,
-        kv_indices,
+        Req_to_tokens,
+        B_req_idx,
+        B_Seqlen,
         att_out,
         att_lse,
         num_kv_splits,
@@ -483,10 +482,10 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
         BLOCK_H=BLOCK_H,
-        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
         logit_cap=logit_cap,
         num_warps=4,
-        num_stages=num_stages,
+        num_stages=2,
         Lk=Lk,
         Lv=Lv,
         **extra_kargs,
@@ -496,27 +495,21 @@ def _decode_grouped_att_m_fwd(
 @triton.jit
 def _fwd_kernel_stage2(
     Mid_O,
-    Mid_O_1,
     O,
-    kv_indptr,
-    num_kv_splits,
+    B_Seqlen,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
     stride_obs,
     stride_oh,
-    MAX_KV_SPLITS: tl.constexpr,
-    MIN_BLOCK_KV: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
-    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
-        kv_indptr + cur_batch
-    )
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
@@ -526,12 +519,10 @@ def _fwd_kernel_stage2(
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
-    offs_logic = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) // Lv
-    kv_len_per_split = (
-        tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
-    )
+    offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
 
-    for split_kv_id in range(0, MAX_KV_SPLITS):
+    for split_kv_id in range(0, NUM_KV_SPLITS):
+        kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
@@ -539,7 +530,7 @@ def _fwd_kernel_stage2(
             tv = tl.load(
                 Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
             )
-            tlogic = tl.load(Mid_O_1 + offs_logic + split_kv_id * stride_mid_os // Lv)
+            tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
             n_e_max = tl.maximum(tlogic, e_max)
 
             old_scale = tl.exp(e_max - n_e_max)
@@ -559,19 +550,17 @@ def _fwd_kernel_stage2(
 
 def _decode_softmax_reducev_fwd(
     logits,
-    lse,
     q,
     o,
     v_buffer,
-    kv_indptr,
+    b_seq_len,
     num_kv_splits,
-    max_kv_splits,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    MAX_KV_SPLITS = max_kv_splits
+    NUM_KV_SPLITS = num_kv_splits
 
     extra_kargs = {}
     if _is_hip:
@@ -582,17 +571,14 @@ def _decode_softmax_reducev_fwd(
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
         logits,
-        lse,
         o,
-        kv_indptr,
-        num_kv_splits,
+        b_seq_len,
         logits.stride(0),
         logits.stride(1),
         logits.stride(2),
         o.stride(0),
         o.stride(1),
-        MAX_KV_SPLITS=MAX_KV_SPLITS,
-        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         num_warps=4,
@@ -606,12 +592,11 @@ def decode_attention_fwd_normal(
     k_buffer,
     v_buffer,
     o,
-    kv_indptr,
-    kv_indices,
+    req_to_token,
+    b_req_idx,
+    b_seq_len,
     attn_logits,
-    attn_lse,
     num_kv_splits,
-    max_kv_splits,
     sm_scale,
     logit_cap=0.0,
 ):
@@ -620,24 +605,14 @@ def decode_attention_fwd_normal(
         k_buffer,
         v_buffer,
         attn_logits,
-        attn_lse,
-        kv_indptr,
-        kv_indices,
+        req_to_token,
+        b_req_idx,
+        b_seq_len,
         num_kv_splits,
-        max_kv_splits,
         sm_scale,
         logit_cap,
     )
-    _decode_softmax_reducev_fwd(
-        attn_logits,
-        attn_lse,
-        q,
-        o,
-        v_buffer,
-        kv_indptr,
-        num_kv_splits,
-        max_kv_splits,
-    )
+    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
 
 def decode_attention_fwd_grouped(
@@ -645,12 +620,11 @@ def decode_attention_fwd_grouped(
     k_buffer,
     v_buffer,
     o,
-    kv_indptr,
-    kv_indices,
+    req_to_token,
+    b_req_idx,
+    b_seq_len,
     attn_logits,
-    attn_lse,
     num_kv_splits,
-    max_kv_splits,
     sm_scale,
     logit_cap=0.0,
 ):
@@ -659,24 +633,14 @@ def decode_attention_fwd_grouped(
         k_buffer,
         v_buffer,
         attn_logits,
-        attn_lse,
-        kv_indptr,
-        kv_indices,
+        req_to_token,
+        b_req_idx,
+        b_seq_len,
         num_kv_splits,
-        max_kv_splits,
         sm_scale,
         logit_cap,
     )
-    _decode_softmax_reducev_fwd(
-        attn_logits,
-        attn_lse,
-        q,
-        o,
-        v_buffer,
-        kv_indptr,
-        num_kv_splits,
-        max_kv_splits,
-    )
+    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, b_seq_len, num_kv_splits)
 
 
 def decode_attention_fwd(
@@ -684,19 +648,15 @@ def decode_attention_fwd(
     k_buffer,
     v_buffer,
     o,
-    kv_indptr,
-    kv_indices,
+    req_to_token,
+    b_req_idx,
+    b_seq_len,
     attn_logits,
-    attn_lse,
     num_kv_splits,
-    max_kv_splits,
     sm_scale,
     logit_cap=0.0,
 ):
-    assert max_kv_splits == attn_logits.shape[2]
-    assert q.shape[0] <= kv_indptr.shape[0] - 1
-    assert q.shape[0] <= attn_logits.shape[0]
-
+    assert num_kv_splits == attn_logits.shape[2]
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
     if kv_group_num == 1:
@@ -706,12 +666,11 @@ def decode_attention_fwd(
             k_buffer,
             v_buffer,
             o,
-            kv_indptr,
-            kv_indices,
+            req_to_token,
+            b_req_idx,
+            b_seq_len,
             attn_logits,
-            attn_lse,
             num_kv_splits,
-            max_kv_splits,
             sm_scale,
             logit_cap,
         )
@@ -722,12 +681,11 @@ def decode_attention_fwd(
             k_buffer,
             v_buffer,
             o,
-            kv_indptr,
-            kv_indices,
+            req_to_token,
+            b_req_idx,
+            b_seq_len,
             attn_logits,
-            attn_lse,
             num_kv_splits,
-            max_kv_splits,
             sm_scale,
             logit_cap,
         )

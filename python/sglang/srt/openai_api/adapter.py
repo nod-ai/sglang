@@ -21,7 +21,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -40,7 +40,7 @@ from sglang.srt.conversation import (
     get_conv_template_by_model_path,
     register_conv_template,
 )
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call_parser import TOOLS_TAG_LIST, FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
@@ -68,7 +68,6 @@ from sglang.srt.openai_api.protocol import (
     FileResponse,
     FunctionResponse,
     LogProbs,
-    MultimodalEmbeddingInput,
     ToolCall,
     TopLogprob,
     UsageInfo,
@@ -990,12 +989,6 @@ def v1_chat_generate_request(
                 else:
                     tools = [item.function.model_dump() for item in request.tools]
 
-                tool_call_parser = tokenizer_manager.server_args.tool_call_parser
-                parser = FunctionCallParser(request.tools, tool_call_parser)
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice
-                )
-
             if chat_template_name is None:
                 openai_compatible_messages = []
 
@@ -1034,15 +1027,10 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
                     )
                 except:
                     #  This except branch will be triggered when the chosen model
-                    #  has a different tools input format that is not compatible
+                    #  has a different tools input format that is not compatiable
                     #  with openAI's apply_chat_template tool_call format, like Mistral.
                     tools = [t if "function" in t else {"function": t} for t in tools]
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
@@ -1050,11 +1038,6 @@ def v1_chat_generate_request(
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
-                        **(
-                            request.chat_template_kwargs
-                            if request.chat_template_kwargs
-                            else {}
-                        ),
                     )
 
                 if assistant_prefix:
@@ -1126,7 +1109,6 @@ def v1_chat_generate_request(
         logprob_start_lens.append(-1)
         top_logprobs_nums.append(request.top_logprobs or 0)
         lora_paths.append(request.lora_path)
-        prompts.append(prompt)
 
         sampling_params = {
             "temperature": request.temperature,
@@ -1202,7 +1184,6 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
-        request_ids = request_ids[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1226,22 +1207,13 @@ def v1_chat_generate_request(
         rid=request_ids,
         modalities=modalities_list,
         lora_path=lora_paths,
-        bootstrap_host=all_requests[0].bootstrap_host,
-        bootstrap_port=all_requests[0].bootstrap_port,
-        bootstrap_room=all_requests[0].bootstrap_room,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
 
 def v1_chat_generate_response(
-    request,
-    ret,
-    created,
-    to_file=False,
-    cache_report=False,
-    tool_call_parser=None,
-    reasoning_parser=None,
+    request, ret, to_file=False, cache_report=False, tool_call_parser=None
 ):
     choices = []
 
@@ -1297,51 +1269,31 @@ def v1_chat_generate_response(
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
             tools = request[idx].tools
-            separate_reasoning = request[idx].separate_reasoning
-            enable_thinking = _get_enable_thinking_from_request(request[idx])
         else:
             tool_choice = request.tool_choice
             tools = request.tools
-            separate_reasoning = request.separate_reasoning
-            enable_thinking = _get_enable_thinking_from_request(request)
 
-        reasoning_text = None
-        if reasoning_parser and separate_reasoning and enable_thinking:
+        if tool_choice != "none" and any([i in text for i in TOOLS_TAG_LIST]):
+            if finish_reason == "stop":
+                finish_reason = "tool_calls"
             try:
-                parser = ReasoningParser(
-                    model_type=reasoning_parser, stream_reasoning=False
-                )
-                reasoning_text, text = parser.parse_non_stream(text)
+                parser = FunctionCallParser(tools, tool_call_parser)
+                full_normal_text, call_info_list = parser.parse_non_stream(text)
+                tool_calls = [
+                    ToolCall(
+                        id=str(call_info.tool_index),
+                        function=FunctionResponse(
+                            name=call_info.name, arguments=call_info.parameters
+                        ),
+                    )
+                    for call_info in call_info_list
+                ]
             except Exception as e:
                 logger.error(f"Exception: {e}")
                 return create_error_response(
                     HTTPStatus.BAD_REQUEST,
-                    "Failed to parse reasoning related info to json format!",
+                    "Failed to parse fc related info to json format!",
                 )
-
-        if tool_choice != "none" and tools:
-            parser = FunctionCallParser(tools, tool_call_parser)
-            if parser.has_tool_call(text):
-                if finish_reason["type"] == "stop":
-                    finish_reason["type"] = "tool_calls"
-                    finish_reason["matched"] = None
-                try:
-                    text, call_info_list = parser.parse_non_stream(text)
-                    tool_calls = [
-                        ToolCall(
-                            id=f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}",
-                            function=FunctionResponse(
-                                name=call_info.name, arguments=call_info.parameters
-                            ),
-                        )
-                        for call_info in call_info_list
-                    ]
-                except Exception as e:
-                    logger.error(f"Exception: {e}")
-                    return create_error_response(
-                        HTTPStatus.BAD_REQUEST,
-                        "Failed to parse fc related info to json format!",
-                    )
 
         if to_file:
             # to make the choice data json serializable
@@ -1349,12 +1301,11 @@ def v1_chat_generate_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": text if text else None,
+                    "content": ret_item["text"] if tool_calls is None else None,
                     "tool_calls": tool_calls,
-                    "reasoning_content": reasoning_text if reasoning_text else None,
                 },
-                "logprobs": choice_logprobs.model_dump() if choice_logprobs else None,
-                "finish_reason": finish_reason["type"] if finish_reason else None,
+                "logprobs": choice_logprobs,
+                "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
                     finish_reason["matched"]
                     if finish_reason and "matched" in finish_reason
@@ -1366,9 +1317,8 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if text else None,
+                    content=ret_item["text"] if tool_calls is None else None,
                     tool_calls=tool_calls,
-                    reasoning_content=reasoning_text if reasoning_text else None,
                 ),
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,
@@ -1444,7 +1394,6 @@ async def v1_chat_completions(
 
     if adapted_request.stream:
         parser_dict = {}
-        reasoning_parser_dict = {}
 
         async def generate_stream_resp():
             tool_call_first = True
@@ -1545,44 +1494,6 @@ async def v1_chat_completions(
                     delta = text[len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
-                    enable_thinking = _get_enable_thinking_from_request(request)
-
-                    if (
-                        tokenizer_manager.server_args.reasoning_parser
-                        and request.separate_reasoning
-                        and enable_thinking
-                    ):
-                        if index not in reasoning_parser_dict:
-                            reasoning_parser_dict[index] = ReasoningParser(
-                                tokenizer_manager.server_args.reasoning_parser,
-                                request.stream_reasoning,
-                            )
-                        reasoning_parser = reasoning_parser_dict[index]
-                        reasoning_text, delta = reasoning_parser.parse_stream_chunk(
-                            delta
-                        )
-                        if reasoning_text:
-                            choice_data = ChatCompletionResponseStreamChoice(
-                                index=index,
-                                delta=DeltaMessage(
-                                    reasoning_content=(
-                                        reasoning_text if reasoning_text else None
-                                    )
-                                ),
-                                finish_reason=finish_reason_type,
-                            )
-                            chunk = ChatCompletionStreamResponse(
-                                id=content["meta_info"]["id"],
-                                created=created,
-                                choices=[choice_data],
-                                model=request.model,
-                            )
-                            yield f"data: {chunk.model_dump_json()}\n\n"
-                        if (delta and len(delta) == 0) or not delta:
-                            stream_buffers[index] = new_stream_buffer
-                            is_firsts[index] = is_first
-                            continue
-
                     if request.tool_choice != "none" and request.tools:
                         if index not in parser_dict:
                             parser_dict[index] = FunctionCallParser(
@@ -1598,14 +1509,13 @@ async def v1_chat_completions(
                         if normal_text:
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(
-                                    content=normal_text if normal_text else None
+                                delta=DeltaMessage(content=normal_text),
+                                finish_reason=(
+                                    finish_reason["type"] if finish_reason else ""
                                 ),
-                                finish_reason=finish_reason_type,
                             )
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],
-                                created=created,
                                 choices=[choice_data],
                                 model=request.model,
                             )
@@ -1614,20 +1524,25 @@ async def v1_chat_completions(
                         # 2) if we found calls, we output them as separate chunk(s)
                         for call_item in calls:
                             # transform call_item -> FunctionResponse + ToolCall
-                            if finish_reason_type == "stop":
+
+                            if (
+                                content["meta_info"]["finish_reason"]
+                                and content["meta_info"]["finish_reason"]["type"]
+                                == "stop"
+                            ):
                                 latest_delta_len = 0
                                 if isinstance(call_item.parameters, str):
                                     latest_delta_len = len(call_item.parameters)
 
                                 expected_call = json.dumps(
-                                    parser.detector.prev_tool_call_arr[index].get(
-                                        "arguments", {}
-                                    ),
+                                    parser.multi_format_parser.detectors[0]
+                                    .prev_tool_call_arr[index]
+                                    .get("arguments", {}),
                                     ensure_ascii=False,
                                 )
-                                actual_call = parser.detector.streamed_args_for_tool[
-                                    index
-                                ]
+                                actual_call = parser.multi_format_parser.detectors[
+                                    0
+                                ].streamed_args_for_tool[index]
                                 if latest_delta_len > 0:
                                     actual_call = actual_call[:-latest_delta_len]
                                 remaining_call = expected_call.replace(
@@ -1635,33 +1550,22 @@ async def v1_chat_completions(
                                 )
                                 call_item.parameters = remaining_call
 
-                                finish_reason_type = "tool_calls"
                             tool_call = ToolCall(
-                                id=(
-                                    f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}"
-                                    if tool_call_first
-                                    else None
-                                ),
-                                index=call_item.tool_index,
+                                id=str(call_item.tool_index),
                                 function=FunctionResponse(
                                     name=call_item.name,
                                     arguments=call_item.parameters,
                                 ),
                             )
-                            tool_call_first = False
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
-                                delta=DeltaMessage(tool_calls=[tool_call]),
-                                finish_reason=(
-                                    None
-                                    if request.stream_options
-                                    and request.stream_options.include_usage
-                                    else finish_reason_type
-                                ),  # additional chunk will be return
+                                delta=DeltaMessage(
+                                    role="assistant", tool_calls=[tool_call]
+                                ),
+                                finish_reason="tool_call",
                             )
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],
-                                created=created,
                                 choices=[choice_data],
                                 model=request.model,
                             )
@@ -1672,44 +1576,27 @@ async def v1_chat_completions(
 
                     else:
                         # No tool calls => just treat this as normal text
-                        if delta or not (
-                            request.stream_options
-                            and request.stream_options.include_usage
-                        ):
-                            choice_data = ChatCompletionResponseStreamChoice(
-                                index=index,
-                                delta=DeltaMessage(content=delta if delta else None),
-                                finish_reason=(
-                                    None
-                                    if request.stream_options
-                                    and request.stream_options.include_usage
-                                    else finish_reason_type
-                                ),
-                                matched_stop=(
-                                    finish_reason["matched"]
-                                    if finish_reason and "matched" in finish_reason
-                                    else None
-                                ),
-                                logprobs=choice_logprobs,
-                            )
-                            chunk = ChatCompletionStreamResponse(
-                                id=content["meta_info"]["id"],
-                                created=created,
-                                choices=[choice_data],
-                                model=request.model,
-                            )
-                            yield f"data: {chunk.model_dump_json()}\n\n"
-                            stream_buffers[index] = new_stream_buffer
-                            is_firsts[index] = is_first
-                if finish_reason_type == "stop" and request.tool_choice != "none":
-                    parser = FunctionCallParser(
-                        tools=request.tools,
-                        tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
-                    )
-                    if parser.has_tool_call(new_stream_buffer):
-                        # if the stream ends with empty string after tool calls
-                        finish_reason_type = "tool_calls"
-
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(content=delta),
+                            finish_reason=(
+                                finish_reason["type"] if finish_reason else ""
+                            ),
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
+                            ),
+                            logprobs=choice_logprobs,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        stream_buffers[index] = new_stream_buffer
+                        is_firsts[index] = is_first
                 if request.stream_options and request.stream_options.include_usage:
                     total_prompt_tokens = sum(
                         tokens
@@ -1774,10 +1661,8 @@ async def v1_chat_completions(
     response = v1_chat_generate_response(
         request,
         ret,
-        created,
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
-        reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
     )
 
     return response

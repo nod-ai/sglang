@@ -18,41 +18,24 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     gpu_p2p_access_check,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import cuda_device_count_stateless, is_cuda
 
 logger = logging.getLogger(__name__)
 
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-
-if _is_cuda:
+if is_cuda():
     try:
         import pynvml
     except ImportError as e:
         logger.warning("Failed to import pynvml with %r", e)
 
-if _is_hip:
-    try:
-        from amdsmi import (
-            AmdSmiException,
-            amdsmi_get_processor_handles,
-            amdsmi_init,
-            amdsmi_shut_down,
-            amdsmi_topo_get_link_type,
-        )
-    except ImportError as e:
-        logger.warning("Failed to import amdsmi with %r", e)
-
 try:
-    if ops.use_vllm_custom_allreduce and not _is_hip:
-        # Use vLLM custom allreduce
+    if ops.use_vllm_custom_allreduce:
         ops.meta_size()
     else:
-        # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
         import sgl_kernel
     custom_ar = True
 except Exception:
-    # For CPUs
+    # For AMD GPUs and CPUs
     custom_ar = False
 
 logger = logging.getLogger(__name__)
@@ -81,22 +64,19 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 @with_nvml_context
-def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
-    if _is_hip:
-        """
-        query if the set of gpus are fully connected by xgmi (1 hop)
-        """
-        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
-        for i, handle in enumerate(handles):
-            for j, peer_handle in enumerate(handles):
-                if i < j:
-                    try:
-                        link_type = amdsmi_topo_get_link_type(handle, peer_handle)
-                        # type is 2 for XGMI
-                        if link_type["hops"] != 1 or link_type["type"] != 2:
-                            return False
-                    except AmdSmiException as error:
-                        logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
+def is_full_nvlink(physical_device_ids: List[int]) -> bool:
+    """
+    query if the set of gpus are fully connected by nvlink (1 hop)
+    """
+    handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+    for i, handle in enumerate(handles):
+        for j, peer_handle in enumerate(handles):
+            if i < j:
+                try:
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                    )
+                    if p2p_status != pynvml.NVML_P2P_STATUS_OK:
                         return False
         return True
     else:
@@ -230,9 +210,12 @@ class CustomAllreduce:
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
-        if _is_cuda or _is_hip:
-            full_nvlink = is_full_nvlink(physical_device_ids, world_size)
+        if is_cuda():
+            assert is_cuda()
 
+            full_nvlink = is_full_nvlink(physical_device_ids)
+        else:
+            full_nvlink = False
         if world_size > 2 and not full_nvlink:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
@@ -257,7 +240,7 @@ class CustomAllreduce:
         self.world_size = world_size
         self.full_nvlink = full_nvlink
 
-        if not _is_hip:
+        if ops.use_vllm_custom_allreduce:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
@@ -280,23 +263,35 @@ class CustomAllreduce:
             )
             ops.register_buffer(self._ptr, self.buffer_ptrs)
         else:
-            # meta data buffers need to be "uncached" for signal on MI200
-            self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-            self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
-            handle = ops.get_meta_buffer_ipc_handle(self.meta)
-            shard_data = (
-                bytes(handle),  # ipc handle to base ptr
-                0,  # offset of base ptr
+            # From TensorRT-LLM getMaxRequiredWorkspaceSize
+            self.max_required_workspace_size = [16 * 1024 * 1024, 8 * 1024 * 1024]
+
+            # sizeof(uint32_t) * (MAX_ALL_REDUCE_BLOCKS + 2) * MAX_RANKS_PER_NODE;
+            self.barrier_max_size = 8 * (36 + 2) * 8
+
+            self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+            self.tmp_result_buffer_ptrs = self.create_shared_buffer(
+                max_size, group=group
             )
-            handles, offsets = self._gather_ipc_meta(shard_data)
-            self.rank_data = torch.empty(
+            self.rank_data_base = torch.empty(
                 8 * 1024 * 1024, dtype=torch.uint8, device=self.device
             )
-            self._ptr = ops.init_custom_ar(
-                self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
+            self.barrier_in_ptrs = self.create_shared_buffer(
+                self.barrier_max_size, group=group
             )
-            self.register_buffer(self.buffer)
+            self.barrier_out_ptrs = self.create_shared_buffer(
+                self.barrier_max_size, group=group
+            )
 
+            self._ptr = ops.init_custom_ar(
+                rank,
+                world_size,
+                self.rank_data_base,
+                self.buffer_ptrs,
+                self.tmp_result_buffer_ptrs,
+                self.barrier_in_ptrs,
+                self.barrier_out_ptrs,
+            )
         self.disabled = False
 
     @staticmethod
@@ -422,15 +417,22 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        if not _is_hip:
+        if ops.use_vllm_custom_allreduce:
             if self.world_size == 2 or self.full_nvlink:
                 return inp_size < self.max_size
             return False
 
-        if _is_hip:
-            if self.full_nvlink:
-                return inp_size < self.max_size
-            return False
+        if self.world_size == 2:
+            return (
+                inp_size < self.max_size
+                and inp_size < self.max_required_workspace_size[0]
+            )
+
+        if self.full_nvlink:
+            return (
+                inp_size < self.max_size
+                and inp_size < self.max_required_workspace_size[1]
+            )
 
         return False
 
@@ -464,12 +466,15 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
-        if registered:
-            ops.all_reduce(self._ptr, inp, out, 0, 0)
+        if ops.use_vllm_custom_allreduce:
+            if registered:
+                ops.all_reduce(self._ptr, inp, out, 0, 0)
+            else:
+                ops.all_reduce(
+                    self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
+                )
         else:
-            ops.all_reduce(
-                self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
-            )
+            ops.all_reduce(self._ptr, inp, out)
         return out
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
@@ -488,21 +493,19 @@ class CustomAllreduce:
                 # allreduce is out-of-place.
                 return torch.empty_like(input)
         else:
-            if _is_hip:
-                # note: outside of cuda graph context,
-                # custom allreduce incurs a cost of cudaMemcpy, which should
-                # be small(<=1% of overall latency) compared to the performance
-                # gains of using custom kernels
-                return self.all_reduce_unreg(input)
-            else:
-                return self.all_reduce(input, registered=False)
+            return self.all_reduce(input, registered=False)
 
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)
-            if _is_cuda:
+            if ops.use_vllm_custom_allreduce:
                 self.free_shared_buffer(self.meta_ptrs)
                 self.free_shared_buffer(self.buffer_ptrs)
+            else:
+                self.free_shared_buffer(self.buffer_ptrs)
+                self.free_shared_buffer(self.tmp_result_buffer_ptrs)
+                self.free_shared_buffer(self.barrier_in_ptrs)
+                self.free_shared_buffer(self.barrier_out_ptrs)
             self._ptr = 0
 
     def __del__(self):

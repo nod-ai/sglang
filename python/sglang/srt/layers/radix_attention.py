@@ -68,17 +68,8 @@ class RadixAttention(nn.Module):
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
-        self.use_irope = use_irope
         self.k_scale = None
         self.v_scale = None
-        self.k_scale_float = None
-        self.v_scale_float = None
-        self.quant_method = None
-        if quant_config is not None:
-            self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
-        if self.quant_method is not None:
-            self.quant_method.create_weights(self)
-        self.attn_type = attn_type
 
     def forward(
         self,
@@ -87,7 +78,6 @@ class RadixAttention(nn.Module):
         v,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-        **kwargs,
     ):
         if k is not None:
             # For cross-layer sharing, kv can be None

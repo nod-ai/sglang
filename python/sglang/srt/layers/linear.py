@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8_utils import BlockQuantScaleParameter
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQLinearMethod",
     "FBGEMMFp8LinearMethod",
     "ModelOptFp8LinearMethod",
-    "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
 ]
 
@@ -425,17 +425,11 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
-
-        if isinstance(param, _ColumnvLLMParameter):
-            param.load_column_parallel_weight(
-                loaded_weight,
-                tp_rank=self.tp_rank,
-                use_presharded_weights=self.use_presharded_weights,
-            )
-        else:
-            # FIXME: This branch is needed to load deepseek v3 awq.
-            # However, we should fix this and avoid the branching here.
-            param.load_column_parallel_weight(loaded_weight)
+        param.load_column_parallel_weight(
+            loaded_weight,
+            tp_rank=self.tp_rank,
+            use_presharded_weights=self.use_presharded_weights,
+        )
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
@@ -742,8 +736,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offset=shard_offset,
             shard_size=shard_size,
             use_presharded_weights=self.use_presharded_weights,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
         )
 
 
@@ -1261,7 +1253,7 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        if isinstance(param, RowvLLMParameter):
+        if isinstance(param, BasevLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
             param.load_row_parallel_weight(

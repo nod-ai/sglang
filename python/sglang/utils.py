@@ -118,6 +118,7 @@ def http_request(
     stream=False,
     api_key=None,
     verify=None,
+    timeout=None,
     method: Optional[str] = None,
 ):
     """A faster version of requests.post with low-level urllib API."""
@@ -463,6 +464,22 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)
+
+
+class TypeBasedDispatcher:
+    def __init__(self, mapping: List[Tuple[Type, Callable]]):
+        self._mapping = mapping
+
+    def __call__(self, obj: Any):
+        for ty, fn in self._mapping:
+            if isinstance(obj, ty):
+                return fn(obj)
+        raise ValueError(f"Invalid object: {obj}")
+
+
+def print_highlight(html_content: str):
+    html_content = str(html_content).replace("\n", "<br>")
+    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
 
 
 class TypeBasedDispatcher:

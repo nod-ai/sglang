@@ -6,12 +6,11 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestQwen2(CustomTestCase):
+class TestQwen2(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "Qwen/Qwen2-7B-Instruct"
@@ -39,10 +38,10 @@ class TestQwen2(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.78)
+        self.assertGreater(metrics["accuracy"], 0.81)
 
 
-class TestQwen2FP8(CustomTestCase):
+class TestQwen2FP8(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "neuralmagic/Qwen2-7B-Instruct-FP8"
@@ -70,7 +69,7 @@ class TestQwen2FP8(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.78)
+        self.assertGreater(metrics["accuracy"], 0.79)
 
 
 if __name__ == "__main__":

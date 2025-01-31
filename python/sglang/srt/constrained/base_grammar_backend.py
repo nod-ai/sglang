@@ -101,6 +101,8 @@ class BaseGrammarObject:
 
 INVALID_GRAMMAR_OBJ = BaseGrammarObject()
 
+from sglang.srt.server_args import ServerArgs
+
 
 @dataclass
 class CacheEntry:
@@ -164,42 +166,24 @@ class BaseGrammarBackend:
         self.cache[key] = value
 
     def reset(self):
-        self.cache.clear()
+        with self.cache_lock:
+            self.cache.clear()
 
 
-def create_grammar_backend(
-    server_args: ServerArgs, tokenizer, vocab_size: int
-) -> Optional[BaseGrammarBackend]:
+def create_grammar_backend(server_args: ServerArgs, tokenizer, vocab_size):
     if server_args.grammar_backend == "outlines":
         from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
 
         grammar_backend = OutlinesGrammarBackend(
             tokenizer,
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+            allow_jump_forward=not server_args.disable_jump_forward,
         )
     elif server_args.grammar_backend == "xgrammar":
         from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 
         grammar_backend = XGrammarGrammarBackend(tokenizer, vocab_size=vocab_size)
-    elif server_args.grammar_backend == "llguidance":
-        from sglang.srt.constrained.llguidance_backend import GuidanceBackend
-
-        grammar_backend = GuidanceBackend(
-            tokenizer=tokenizer,
-            whitespace_pattern=server_args.constrained_json_whitespace_pattern,
-        )
-    elif server_args.grammar_backend == "none":
-        return None
     else:
         raise ValueError(f"Invalid grammar backend: {server_args.grammar_backend}")
-
-    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
-        from sglang.srt.constrained.reasoner_grammar_backend import (
-            ReasonerGrammarBackend,
-        )
-
-        grammar_backend = ReasonerGrammarBackend(
-            grammar_backend, tokenizer.think_end_id
-        )
 
     return grammar_backend

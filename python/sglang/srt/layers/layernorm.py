@@ -19,13 +19,9 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda_available
 
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-
-if _is_cuda:
+if is_cuda_available():
     from sgl_kernel import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
@@ -156,28 +152,8 @@ class GemmaRMSNorm(CustomOp):
         return out
 
 
-class Gemma3RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-
-if not (_is_cuda or _is_hip):
+if not is_cuda_available():
     logger.info(
-        "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm

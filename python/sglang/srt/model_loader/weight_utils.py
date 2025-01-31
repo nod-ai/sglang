@@ -28,6 +28,7 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from safetensors.torch import load_file, safe_open, save_file
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
@@ -417,19 +418,12 @@ def safetensors_encrypted_weights_iterator(
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     is_all_weights_sharded: bool = False,
-    decryption_key: Optional[str] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     If is_all_weights_sharded is True, it uses more optimize read by reading an
     entire file instead of reading each tensor one by one.
     """
-    if decryption_key:
-        yield from safetensors_encrypted_weights_iterator(
-            hf_weights_files, is_all_weights_sharded, decryption_key
-        )
-        return
-
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -439,9 +433,15 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        result = safetensors.torch.load_file(st_file, device="cpu")
-        for name, param in result.items():
-            yield name, param
+        if not is_all_weights_sharded:
+            with safe_open(st_file, framework="pt") as f:
+                for name in f.keys():  # noqa: SIM118
+                    param = f.get_tensor(name)
+                    yield name, param
+        else:
+            result = load_file(st_file, device="cpu")
+            for name, param in result.items():
+                yield name, param
 
 
 def pt_weights_iterator(

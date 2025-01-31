@@ -382,7 +382,7 @@ class OpenAI(BaseBackend):
 
 def openai_completion(
     client, token_usage, is_chat=None, retries=3, prompt=None, **kwargs
-) -> Union[str, List[str]]:
+):
     # if "ebnf" is in kwargs, warn and remove
     if "ebnf" in kwargs:
         warnings.warn("EBNF is not officially supported by OpenAI endpoints. Ignoring.")

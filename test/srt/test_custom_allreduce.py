@@ -17,7 +17,6 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     initialize_model_parallel,
 )
-from sglang.test.test_utils import CustomTestCase
 
 
 def get_open_port() -> int:
@@ -43,8 +42,7 @@ def multi_process_parallel(
     # as compared to multiprocessing.
     # NOTE: We need to set working_dir for distributed tests,
     # otherwise we may get import errors on ray workers
-
-    ray.init(log_to_driver=True)
+    ray.init(log_to_driver=False)
 
     distributed_init_port = get_open_port()
     refs = []
@@ -55,7 +53,7 @@ def multi_process_parallel(
     ray.shutdown()
 
 
-class TestCustomAllReduce(CustomTestCase):
+class TestCustomAllReduce(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         random.seed(42)

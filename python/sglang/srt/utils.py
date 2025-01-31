@@ -14,10 +14,8 @@
 """Common utilities."""
 
 import base64
-import builtins
 import ctypes
 import dataclasses
-import importlib
 import io
 import ipaddress
 import itertools
@@ -44,22 +42,8 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
-from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
-from pathlib import Path
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generic,
-    List,
-    Optional,
-    Protocol,
-    Set,
-    Tuple,
-    TypeVar,
-    Union,
-)
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import psutil
@@ -139,7 +123,7 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
 def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda
+    return hasattr(torch, "cuda") and torch.version.cuda is not None
 
 
 def is_cuda_alike():
@@ -165,64 +149,11 @@ def is_flashinfer_available():
     """
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
-    return importlib.util.find_spec("flashinfer") is not None and is_cuda()
+    return torch.cuda.is_available() and torch.version.cuda
 
 
-_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
-    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-)
-
-
-class DynamicGradMode(_DecoratorContextManager):
-    """
-    A combination of torch.no_grad and torch.inference_mode,
-    with their behavior controlled by an environment variable. Just refer to them.
-    """
-
-    @staticmethod
-    def set_inference_mode(mode: bool):
-        if isinstance(mode, bool):
-            global _ENABLE_TORCH_INFERENCE_MODE
-
-            _ENABLE_TORCH_INFERENCE_MODE = mode
-        else:
-            logger.warning("mode is not a boolean object")
-
-    def __init__(self, mode=True):
-        if not torch._jit_internal.is_scripting():
-            super().__init__()
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self.mode = mode
-        else:
-            self.prev = False
-
-    def __new__(cls, mode_or_orig_func=True if _ENABLE_TORCH_INFERENCE_MODE else None):
-        if mode_or_orig_func is None or isinstance(mode_or_orig_func, bool):
-            return super().__new__(cls)
-        return cls()(mode_or_orig_func)
-
-    def __enter__(self) -> None:
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self._inference_mode_context = torch._C._InferenceMode(self.mode)
-            self._inference_mode_context.__enter__()
-        else:
-            self.prev = torch.is_grad_enabled()
-            torch.set_grad_enabled(False)
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            self._inference_mode_context.__exit__(exc_type, exc_value, traceback)
-        else:
-            torch.set_grad_enabled(self.prev)
-
-    def clone(self) -> "DynamicGradMode":
-        r"""
-        Create a copy of this class
-        """
-        if _ENABLE_TORCH_INFERENCE_MODE:
-            return self.__class__(self.mode)
-        else:
-            return self.__class__()
+def is_cuda_available():
+    return torch.cuda.is_available() and torch.version.cuda
 
 
 def enable_show_time_cost():
@@ -291,9 +222,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(
-    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
-):
+def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -343,16 +272,6 @@ def get_available_gpu_memory(
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         free_gpu_memory = psutil.virtual_memory().available
-    elif device == "npu":
-        num_gpus = torch.npu.device_count()
-        assert gpu_id < num_gpus
-
-        if torch.npu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
-                "which may cause useless memory allocation for torch NPU context.",
-            )
-        free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -763,14 +682,11 @@ def monkey_patch_p2p_access_check():
 
 
 def monkey_patch_vllm_gguf_config():
-    try:
-        from vllm.model_executor.layers.quantization.gguf import (
-            GGUFConfig,
-            GGUFEmbeddingMethod,
-            GGUFLinearMethod,
-        )
-    except ImportError:
-        return
+    from vllm.model_executor.layers.quantization.gguf import (
+        GGUFConfig,
+        GGUFEmbeddingMethod,
+        GGUFLinearMethod,
+    )
 
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -920,7 +836,6 @@ def broadcast_pyobj(
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
-    force_cpu_device: bool = True,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
@@ -974,7 +889,7 @@ def point_to_point_pyobj(
     if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long)
-            dist.send(tensor_size, dst=dst, group=group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
@@ -983,20 +898,20 @@ def point_to_point_pyobj(
             )
             tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.send(tensor_size, dst=dst, group=group)
-            dist.send(tensor_data, dst=dst, group=group)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
 
     elif rank == dst:
         tensor_size = torch.tensor([0], dtype=torch.long)
-        dist.recv(tensor_size, src=src, group=group)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(size, dtype=torch.uint8)
-        dist.recv(tensor_data, src=src, group=group)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
@@ -1037,6 +952,13 @@ def pytorch_profile(name, func, *args, data_size=-1):
     return result
 
 
+def first_rank_print(*args, **kwargs):
+    if torch.cuda.current_device() == 0:
+        print(*args, **kwargs)
+    else:
+        pass
+
+
 def get_zmq_socket(
     context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
 ):
@@ -1055,18 +977,9 @@ def get_zmq_socket(
     def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
+    elif socket_type == zmq.PULL:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type == zmq.DEALER:
-        set_send_opt()
-        set_recv_opt()
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
@@ -1569,43 +1482,26 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-def dataclass_to_string_truncated(
-    data, max_length=2048, skip_names: Optional[Set[str]] = None
-):
-    if skip_names is None:
-        skip_names = set()
-    if isinstance(data, str):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
-        else:
-            return f"{repr(data)}"
-    elif isinstance(data, (list, tuple)):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
-        else:
-            return str(data)
-    elif isinstance(data, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
-    elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
-        return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
-            + ")"
+@lru_cache(maxsize=8)
+def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
+    # Note: cuda_visible_devices is not used, but we keep it as an argument for
+    # LRU Cache purposes.
+
+    # Code below is based on
+    # https://github.com/pytorch/pytorch/blob/
+    # c1cd946818442aca8c7f812b16d187ce1586c3bc/
+    # torch/cuda/__init__.py#L831C1-L831C17
+    import torch.version
+
+    if not torch.cuda._is_compiled():
+        return 0
+    if is_hip():
+        # ROCm uses amdsmi instead of nvml for stateless device count
+        # This requires a sufficiently modern version of Torch 2.4.0
+        raw_count = (
+            torch.cuda._device_count_amdsmi()
+            if (hasattr(torch.cuda, "_device_count_amdsmi"))
+            else -1
         )
     else:
         return str(data)
@@ -1631,45 +1527,71 @@ def permute_weight(x: torch.Tensor) -> torch.Tensor:
     return x_
 
 
+def dataclass_to_string_truncated(data, max_length=2048):
+    if isinstance(data, str):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
+        else:
+            return f"{repr(data)}"
+    elif isinstance(data, (list, tuple)):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+        else:
+            return str(data)
+    elif isinstance(data, dict):
+        return (
+            "{"
+            + ", ".join(
+                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+                for k, v in data.items()
+            )
+            + "}"
+        )
+    elif dataclasses.is_dataclass(data):
+        fields = dataclasses.fields(data)
+        return (
+            f"{data.__class__.__name__}("
+            + ", ".join(
+                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                for f in fields
+            )
+            + ")"
+        )
+    else:
+        return str(data)
+
+
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    b_ = x.shape[0]
+    n_ = x.shape[1]
+    k_ = x.shape[2]
+
+    x_ = x
+    if x.dtype == torch.bfloat16 or x.dtype == torch.float16:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 32), 4, 8)
+    elif x.dtype == torch.float8_e4m3fnuz or x.dtype == torch.int8:
+        x_ = x_.view(int(b_), int(n_ / 16), 16, int(k_ / 64), 4, 16)
+    else:
+        return x_
+
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    return x_
+
+
 class MultiprocessingSerializer:
     @staticmethod
-    def serialize(obj, output_str: bool = False):
-        """
-        Serialize a Python object using ForkingPickler.
-
-        Args:
-            obj: The object to serialize.
-            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
-
-        Returns:
-            bytes or str: The serialized object.
-        """
+    def serialize(obj):
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
-        output = buf.read()
-
-        if output_str:
-            # Convert bytes to base64-encoded string
-            output = base64.b64encode(output).decode("utf-8")
-
-        return output
+        return buf.read()
 
     @staticmethod
     def deserialize(data):
-        """
-        Deserialize a previously serialized object.
-
-        Args:
-            data (bytes or str): The serialized data, optionally base64-encoded.
-
-        Returns:
-            The deserialized Python object.
-        """
-        if isinstance(data, str):
-            # Decode base64 string to bytes
-            data = base64.b64decode(data)
-
         return ForkingPickler.loads(data)
 
 
@@ -1682,7 +1604,7 @@ def debug_timing(func):
             tic.record()
             result = func(*args, **kwargs)
             toc.record()
-            toc.synchronize()  # Wait for the function to complete without synchronizing all ops on the GPU
+            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
             elapsed = tic.elapsed_time(toc)
             indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
             num_tokens = len(indices) if indices is not None else 0
@@ -1712,9 +1634,9 @@ def pyspy_dump_schedulers():
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, check=True
         )
-        logger.error(f"Pyspy dump for PID {pid}:\n{result.stdout}")
+        logger.info(f"Profile for PID {pid}:\n{result.stdout}")
     except subprocess.CalledProcessError as e:
-        logger.error(f"Pyspy failed to dump PID {pid}. Error: {e.stderr}")
+        logger.info(f"Failed to profile PID {pid}. Error: {e.stderr}")
 
 
 def kill_itself_when_parent_died():
@@ -1724,7 +1646,7 @@ def kill_itself_when_parent_died():
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
     else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+        logger.warninig("kill_itself_when_parent_died is only supported in linux.")
 
 
 def set_uvicorn_logging_configs():
@@ -1776,9 +1698,9 @@ def get_ip() -> str:
 
 
 def get_open_port() -> int:
+
     port = os.getenv("SGLANG_PORT")
     if port is not None:
-        port = int(port)
         while True:
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1807,45 +1729,6 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
-def configure_ipv6(dist_init_addr):
-    addr = dist_init_addr
-    end = addr.find("]")
-    if end == -1:
-        raise ValueError("invalid IPv6 address format: missing ']'")
-
-    host = addr[: end + 1]
-
-    # this only validates the address without brackets: we still need the below checks.
-    # if it's invalid, immediately raise an error so we know it's not formatting issues.
-    if not is_valid_ipv6_address(host[1:end]):
-        raise ValueError(f"invalid IPv6 address: {host}")
-
-    port_str = None
-    if len(addr) > end + 1:
-        if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
-        else:
-            raise ValueError("received IPv6 address format: expected ':' after ']'")
-
-    if not port_str:
-        raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
-    return port, host
-
-
-def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
-
-
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -1853,15 +1736,7 @@ def rank0_print(msg: str):
         print(msg, flush=True)
 
 
-def get_cuda_version():
-    if torch.version.cuda:
-        return tuple(map(int, torch.version.cuda.split(".")))
-    return (0, 0)
-
-
 def launch_dummy_health_check_server(host, port):
-    import asyncio
-
     import uvicorn
     from fastapi import FastAPI, Response
 
@@ -1877,383 +1752,10 @@ def launch_dummy_health_check_server(host, port):
         """Check the health of the http server."""
         return Response(status_code=200)
 
-    config = uvicorn.Config(
+    uvicorn.run(
         app,
         host=host,
         port=port,
         timeout_keep_alive=5,
-        loop="auto",
-        log_config=None,
-        log_level="warning",
+        loop="uvloop",
     )
-    server = uvicorn.Server(config=config)
-
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host}:{port}"
-        )
-        loop.create_task(server.serve())
-
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host}:{port}")
-        server.run()
-
-
-def create_checksum(directory: str):
-    raise NotImplementedError()
-
-
-def set_cuda_arch():
-    if is_flashinfer_available():
-        capability = torch.cuda.get_device_capability()
-        arch = f"{capability[0]}.{capability[1]}"
-        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
-
-
-def next_power_of_2(n: int):
-    return 1 << (n - 1).bit_length() if n > 0 else 1
-
-
-setattr(triton, "next_power_of_2", next_power_of_2)
-
-
-@contextmanager
-def empty_context(*args, **kwargs):
-    try:
-        # Setup code goes here
-        yield
-    finally:
-        # Cleanup code goes here
-        pass
-
-
-def add_prefix(name: str, prefix: str) -> str:
-    """Add a weight path prefix to a module name.
-
-    Args:
-        name: base module name.
-        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
-
-    Returns:
-        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
-    """
-    return name if not prefix else f"{prefix}.{name}"
-
-
-def is_remote_url(url: Union[str, Path]) -> bool:
-    """
-    Check if the URL is a remote URL of the format:
-    <connector_type>://<host>:<port>/<model_name>
-    """
-    if isinstance(url, Path):
-        return False
-
-    pattern = r"(.+)://(.*)"
-    m = re.match(pattern, url)
-    return m is not None
-
-
-def parse_connector_type(url: str) -> str:
-    """
-    Parse the connector type from the URL of the format:
-    <connector_type>://<path>
-    """
-    pattern = r"(.+)://(.*)"
-    m = re.match(pattern, url)
-    if m is None:
-        return ""
-
-    return m.group(1)
-
-
-def retry(
-    fn,
-    max_retry: int,
-    initial_delay: float = 2.0,
-    max_delay: float = 60.0,
-    should_retry: Callable[[Any], bool] = lambda e: True,
-):
-    for try_index in itertools.count():
-        try:
-            return fn()
-        except Exception as e:
-            if try_index >= max_retry:
-                raise Exception(f"retry() exceed maximum number of retries.")
-
-            if not should_retry(e):
-                raise Exception(f"retry() observe errors that should not be retried.")
-
-            delay = min(initial_delay * (2**try_index), max_delay) * (
-                0.75 + 0.25 * random.random()
-            )
-
-            logger.warning(
-                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
-            )
-            traceback.print_exc()
-
-            time.sleep(delay)
-
-
-def flatten_nested_list(nested_list):
-    if isinstance(nested_list, list):
-        return [
-            item for sublist in nested_list for item in flatten_nested_list(sublist)
-        ]
-    else:
-        return [nested_list]
-
-
-class DeepEPMode(Enum):
-    normal = "normal"
-    low_latency = "low_latency"
-    auto = "auto"
-
-    def enable_normal(self):
-        return self in [DeepEPMode.normal, DeepEPMode.auto]
-
-    def enable_low_latency(self):
-        return self in [DeepEPMode.low_latency, DeepEPMode.auto]
-
-    def resolve(self, forward_mode):
-        if self != DeepEPMode.auto:
-            return self
-
-        if forward_mode.is_decode():
-            return DeepEPMode.low_latency
-        else:
-            return DeepEPMode.normal
-
-
-def is_non_idle_and_non_empty(forward_mode, hidden_states):
-    return (
-        (forward_mode is not None)
-        and not forward_mode.is_idle()
-        and hidden_states.shape[0] > 0
-    )
-
-
-def fast_topk(values, topk, dim):
-    if topk == 1:
-        # Use max along the specified dimension to get both value and index
-        return torch.max(values, dim=dim, keepdim=True)
-    else:
-        # Use topk for efficiency with larger k values
-        return torch.topk(values, topk, dim=dim)
-
-
-def _check(cc_major):
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
-        map(int, torch.version.cuda.split(".")[:2])
-    ) >= (12, 3)
-
-
-is_ampere_with_cuda_12_3 = lambda: _check(8)
-is_hopper_with_cuda_12_3 = lambda: _check(9)
-
-
-def is_blackwell():
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == 10
-
-
-def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-
-
-def get_local_ip_by_remote() -> str:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
-
-    try:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-            return ip
-    except Exception:
-        pass
-
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        raise ValueError("Can not get local ip")
-
-
-def is_page_size_one(server_args):
-    return server_args.page_size == 1
-
-
-# TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
-# TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
-def is_no_spec_infer_or_topk_one(server_args):
-    return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk == 1
-        and is_page_size_one(server_args)
-    )
-
-
-def is_fa3_default_architecture(hf_config):
-    architectures = getattr(hf_config, "architectures", None)
-    if not isinstance(architectures, list) or not architectures:
-        return False
-    default_archs = {
-        "Qwen2ForCausalLM",
-        "Llama4ForConditionalGeneration",
-        "LlamaForCausalLM",
-        "Gemma2ForCausalLM",
-        "Gemma3ForConditionalGeneration",
-        "Qwen3ForCausalLM",
-        "Qwen3MoeForCausalLM",
-    }
-    return architectures[0] in default_archs
-
-
-# Can be more general if it is used in multiple places (keep it simple and thus not general now)
-class BumpAllocator:
-    def __init__(self, buffer_size: int, dtype, device):
-        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
-        self._pointer = 0
-
-    def allocate(self, size: int):
-        assert self._pointer + size <= len(self._buffer)
-        output = self._buffer[self._pointer : self._pointer + size]
-        self._pointer += size
-        return output
-
-
-def log_info_on_rank0(logger, msg):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
-
-
-def load_json_config(data: str):
-    try:
-        return json.loads(data)
-    except JSONDecodeError:
-        return json.loads(Path(data).read_text())
-
-
-def dispose_tensor(x: torch.Tensor):
-    x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
-
-
-T = TypeVar("T")
-
-
-class Withable(Generic[T]):
-    def __init__(self):
-        self._value: Optional[T] = None
-
-    @property
-    def value(self) -> T:
-        return self._value
-
-    @contextmanager
-    def with_value(self, new_value: T):
-        assert self._value is None
-        self._value = new_value
-        try:
-            yield
-        finally:
-            assert self._value is new_value
-            self._value = None
-
-
-def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
-    import huggingface_hub as hf
-
-    # Build cache path
-    cache_path = os.path.join(
-        hf.constants.HF_HUB_CACHE,
-        hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
-    )
-
-    # Get revision from main ref if not specified
-    if not revision:
-        ref_path = os.path.join(cache_path, "refs", "main")
-        if os.path.isfile(ref_path):
-            with open(ref_path) as f:
-                revision = f.read().strip()
-
-    # List files from revision directory
-    if revision:
-        rev_dir = os.path.join(cache_path, "snapshots", revision)
-        if os.path.isdir(rev_dir):
-            return rev_dir
-
-    return None
-
-
-def read_system_prompt_from_file(model_name: str) -> str:
-    """Read system prompt from a file in the HuggingFace cache directory.
-
-    Args:
-        model_name: The model name to construct the file path
-
-    Returns:
-        The system prompt content from the file, or empty string if file not found
-    """
-    try:
-        local_repo_dir = find_local_repo_dir(model_name)
-        if local_repo_dir:
-            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
-            if os.path.exists(system_prompt_file):
-                with open(system_prompt_file, "r", encoding="utf-8") as f:
-                    return f.read()
-
-        return ""
-    except Exception:
-        # If anything fails, return empty string
-        return ""
-
-
-def bind_or_assign(target, source):
-    if target is not None:
-        target.copy_(source)
-        return target
-    else:
-        return source
-
-
-def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
-
-
-try:
-    import sgl_kernel
-
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
-
-
-def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available

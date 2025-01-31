@@ -20,7 +20,7 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from sglang.srt.mm_utils import has_valid_data
 
@@ -40,10 +40,6 @@ class SessionParams:
     rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
-
-
-AudioDataItem = Union[str, Dict]
-ImageDataItem = Union[Image, str, Dict]
 
 
 @dataclass
@@ -92,22 +88,10 @@ class GenerateReqInput:
 
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
-
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
-
-    # Whether to return hidden states
-    return_hidden_states: bool = False
-
-    # For disaggregated inference
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-
-    def contains_mm_input(self) -> bool:
-        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         """
@@ -379,6 +363,13 @@ class GenerateReqInput:
             ):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
+            if self.custom_logit_processor is None:
+                self.custom_logit_processor = [None] * num
+            elif not isinstance(self.custom_logit_processor, list):
+                self.custom_logit_processor = [self.custom_logit_processor] * num
+            else:
+                assert self.parallel_sample_num == 1
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         self.rid = uuid.uuid4().hex
@@ -405,17 +396,6 @@ class GenerateReqInput:
                 self.custom_logit_processor[i]
                 if self.custom_logit_processor is not None
                 else None
-            ),
-            return_hidden_states=self.return_hidden_states,
-            # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
-            bootstrap_host=(
-                self.bootstrap_host[i] if self.bootstrap_host is not None else None
-            ),
-            bootstrap_port=(
-                self.bootstrap_port[i] if self.bootstrap_port is not None else None
-            ),
-            bootstrap_room=(
-                self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
         )
 
@@ -456,14 +436,6 @@ class TokenizedGenerateReqInput:
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[str] = None
 
-    # Whether to return hidden states
-    return_hidden_states: bool = False
-
-    # For disaggregated inference
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
-
 
 @dataclass
 class EmbeddingReqInput:
@@ -490,11 +462,6 @@ class EmbeddingReqInput:
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
-    # The modalities of the image data [image, multi-images, video]
-    modalities: Optional[List[str]] = None
-
-    def contains_mm_input(self) -> bool:
-        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -581,6 +548,8 @@ class BatchTokenIDOut:
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
+    # The version id to sync decode status with in detokenizer_manager
+    vids: List[int]
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
@@ -606,25 +575,6 @@ class BatchTokenIDOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-    input_token_ids_logprobs_val: List[List]
-    input_token_ids_logprobs_idx: List[List]
-    output_token_ids_logprobs_val: List[List]
-    output_token_ids_logprobs_idx: List[List]
-
-    # Hidden states
-    output_hidden_states: List[List[float]]
-
-
-@dataclass
-class BatchMultimodalDecodeReq:
-    # The request id
-    rids: List[str]
-    finished_reasons: List[BaseFinishReason]
-
-    # Token counts
-    prompt_tokens: List[int]
-    completion_tokens: List[int]
-    cached_tokens: List[int]
 
 
 @dataclass
@@ -635,8 +585,6 @@ class BatchStrOut:
     finished_reasons: List[dict]
     # The output decoded strings
     output_strs: List[str]
-    # The token ids
-    output_ids: Optional[List[int]]
 
     # Token counts
     prompt_tokens: List[int]
@@ -653,28 +601,6 @@ class BatchStrOut:
     input_top_logprobs_idx: List[List]
     output_top_logprobs_val: List[List]
     output_top_logprobs_idx: List[List]
-    input_token_ids_logprobs_val: List[List]
-    input_token_ids_logprobs_idx: List[List]
-    output_token_ids_logprobs_val: List[List]
-    output_token_ids_logprobs_idx: List[List]
-
-    # Hidden states
-    output_hidden_states: List[List[float]]
-
-
-@dataclass
-class BatchMultimodalOut:
-    # The request id
-    rids: List[str]
-    # The finish reason
-    finished_reasons: List[dict]
-    # The outputs
-    outputs: List[List[Dict]]
-
-    # Token counts
-    prompt_tokens: List[int]
-    completion_tokens: List[int]
-    cached_tokens: List[int]
 
 
 @dataclass
@@ -687,7 +613,6 @@ class BatchEmbeddingOut:
     embeddings: List[List[float]]
     # Token counts
     prompt_tokens: List[int]
-    cached_tokens: List[int]
 
 
 @dataclass
@@ -731,17 +656,7 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    """Update model weights from tensor input.
-
-    - Tensors are serialized for transmission
-    - Data is structured in JSON for easy transmission over HTTP
-    """
-
-    serialized_named_tensors: List[Union[str, bytes]]
-    # Optional format specification for loading
-    load_format: Optional[str] = None
-    # Whether to flush the cache after updating weights
-    flush_cache: bool = True
+    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
 
 
 @dataclass
@@ -800,16 +715,6 @@ class ResumeMemoryOccupationReqInput:
 
 @dataclass
 class ResumeMemoryOccupationReqOutput:
-    pass
-
-
-@dataclass
-class SlowDownReqInput:
-    forward_sleep_time: Optional[float]
-
-
-@dataclass
-class SlowDownReqOutput:
     pass
 
 
@@ -897,6 +802,14 @@ class ConfigureLoggingReq:
 
 
 @dataclass
+class ConfigureLoggingReq:
+    log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
+    dump_requests_folder: Optional[str] = None
+    dump_requests_threshold: Optional[int] = None
+
+
+@dataclass
 class OpenSessionReqInput:
     capacity_of_str_len: int
     session_id: Optional[str] = None
@@ -914,11 +827,6 @@ class OpenSessionReqOutput:
 
 
 @dataclass
-class HealthCheckOutput:
-    pass
-
-
-@dataclass
 class Function:
     description: Optional[str] = None
     name: Optional[str] = None
@@ -932,7 +840,7 @@ class Tool:
 
 
 @dataclass
-class ParseFunctionCallReq:
+class FunctionCallReqInput:
     text: str  # The text to parse.
     tools: List[Tool] = field(
         default_factory=list
@@ -940,27 +848,3 @@ class ParseFunctionCallReq:
     tool_call_parser: Optional[str] = (
         None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
     )
-
-
-@dataclass
-class SeparateReasoningReqInput:
-    text: str  # The text to parse.
-    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
-
-
-@dataclass
-class VertexGenerateReqInput:
-    instances: List[dict]
-    parameters: Optional[dict] = None
-
-
-@dataclass
-class RpcReqInput:
-    method: str
-    parameters: Optional[Dict] = None
-
-
-@dataclass
-class RpcReqOutput:
-    success: bool
-    message: str

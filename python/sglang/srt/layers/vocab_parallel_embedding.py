@@ -13,7 +13,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -222,7 +221,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         enable_tp: bool = True,
-        use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
         super().__init__()
@@ -465,7 +463,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size
                 // (self.tp_size if self.use_presharded_weights else 1)
-            ), f"{self.org_vocab_size=} {self.use_presharded_weights=} {loaded_weight.shape[output_dim]=}"
+            )
 
         # Copy the data.
         if not self.use_presharded_weights:
@@ -534,18 +532,16 @@ class ParallelLMHead(VocabParallelEmbedding):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
         super().__init__(
             num_embeddings,
             embedding_dim,
-            params_dtype=params_dtype,
-            org_num_embeddings=org_num_embeddings,
-            padding_size=padding_size,
-            quant_config=quant_config,
-            prefix=prefix,
-            use_attn_tp_group=use_attn_tp_group,
+            params_dtype,
+            org_num_embeddings,
+            padding_size,
+            quant_config,
+            prefix,
             use_presharded_weights=use_presharded_weights,
         )
         self.quant_config = quant_config

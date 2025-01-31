@@ -57,7 +57,6 @@ class BenchArgs:
     profile: bool = False
     skip_warmup: bool = False
     do_not_exit: bool = False
-    prompt_suffix: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -178,12 +177,6 @@ class BenchArgs:
             "--do-not-exit",
             action="store_true",
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
-        )
-        parser.add_argument(
-            "--prompt-suffix",
-            type=str,
-            default="",
-            help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
         )
 
     @classmethod

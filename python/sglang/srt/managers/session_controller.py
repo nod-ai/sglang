@@ -35,12 +35,12 @@ class SessionReqNode:
         for req_node in self.childs:
             req_node.clear(req_dict)
 
-        if self.req.finished_reason is None:
+        if self.req.finished_reason == None:
             self.req.to_abort = True
         del req_dict[self.req.rid]
 
     def abort(self):
-        if self.req.finished_reason is None:
+        if self.req.finished_reason == None:
             self.req.to_abort = True
 
     def __str__(self):
@@ -54,7 +54,7 @@ class SessionReqNode:
             prefix += " -- " + self.childs[0].req.rid
             ret = self.childs[0]._str_helper(prefix)
             for child in self.childs[1:]:
-                prefix = " " * len(origin_prefix) + r" \- " + child.req.rid
+                prefix = " " * len(origin_prefix) + " \- " + child.req.rid
                 ret += child._str_helper(prefix)
             return ret
 
@@ -132,13 +132,9 @@ class Session:
             lora_path=req.lora_path,
             session_id=self.session_id,
             custom_logit_processor=req.custom_logit_processor,
-            stream=req.stream,
-            return_logprob=req.return_logprob,
-            top_logprobs_num=req.top_logprobs_num,
-            token_ids_logprob=req.token_ids_logprob,
         )
         if last_req is not None:
-            new_req.multimodal_inputs = last_req.mm_inputs
+            new_req.image_inputs = last_req.image_inputs
         new_req.tokenizer = tokenizer
         if abort:
             new_req.to_abort = True

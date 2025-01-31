@@ -31,8 +31,7 @@ from transformers import (
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.hf_transformers_utils import get_tokenizer
-from sglang.srt.utils import load_image
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
@@ -478,16 +477,6 @@ class SRTRunner:
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
-        enable_dp_attention = dp_size > 1
-
-        spec_kwargs = {}
-        if speculative_draft_model_path:
-            spec_kwargs["speculative_draft_model_path"] = speculative_draft_model_path
-            spec_kwargs["speculative_algorithm"] = speculative_algorithm
-            spec_kwargs["speculative_num_steps"] = speculative_num_steps
-            spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk
-            spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
-
         self.engine = Engine(
             model_path=model_path,
             tp_size=tp_size,
@@ -531,16 +520,49 @@ class SRTRunner:
         token_ids_logprob: Optional[List[int]] = None,
     ):
         if self.is_generation:
-            return self.forward_generation_raw(
-                engine=self.engine,
-                prompts=prompts,
-                max_new_tokens=max_new_tokens,
-                lora_paths=lora_paths,
-                logprob_start_len=logprob_start_len,
-                top_k=top_k,
-                token_ids_logprob=token_ids_logprob,
+            # the return value contains logprobs from prefill
+            output_strs = []
+            top_input_logprobs = []
+            top_output_logprobs = []
+            sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+            for i, prompt in enumerate(prompts):
+                response = self.engine.generate(
+                    prompt,
+                    lora_path=lora_paths[i] if lora_paths else None,
+                    sampling_params=sampling_params,
+                    return_logprob=True,
+                    logprob_start_len=0,
+                    top_logprobs_num=NUM_TOP_LOGPROBS,
+                )
+                output_strs.append(response["text"])
+                top_input_logprobs.append(
+                    [
+                        [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
+                        for x in response["meta_info"]["input_top_logprobs"][1:]
+                    ]
+                    + [
+                        [
+                            tup[0]
+                            for tup in response["meta_info"]["output_top_logprobs"][0][
+                                :NUM_TOP_LOGPROBS
+                            ]
+                        ]
+                    ]
+                )
+                top_output_logprobs.append(
+                    [
+                        [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
+                        for x in response["meta_info"]["output_top_logprobs"]
+                    ]
+                )
+
+            return ModelOutput(
+                output_strs=output_strs,
+                top_input_logprobs=top_input_logprobs,
+                top_output_logprobs=top_output_logprobs,
             )
         else:
+            response = self.engine.encode(prompts)
             if self.model_type == "embedding":
                 response = self.engine.encode(prompt=prompts, image_data=image_data)
                 if isinstance(response, list):
@@ -566,14 +588,21 @@ class SRTRunner:
         only return output strings and no logprobs
         """
         if self.is_generation:
-            return self.batch_forward_generation_raw(
-                engine=self.engine,
-                prompts=prompts,
-                max_new_tokens=max_new_tokens,
-                lora_paths=lora_paths,
+            # the return value contains logprobs from prefill
+            output_strs = []
+            sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
+            response = self.engine.generate(
+                prompts,
+                lora_path=lora_paths if lora_paths else None,
+                sampling_params=sampling_params,
+            )
+            output_strs = [r["text"] for r in response]
+
+            return ModelOutput(
+                output_strs=output_strs,
             )
         else:
-            response = self.engine.encode(prompts, image_data)
+            response = self.engine.encode(prompts)
             if self.model_type == "embedding":
                 logits = [x["embedding"] for x in response]
                 return ModelOutput(embed_logits=logits)
@@ -587,157 +616,6 @@ class SRTRunner:
     def __exit__(self, exc_type, exc_value, traceback):
         self.engine.shutdown()
         del self.engine
-
-    @staticmethod
-    def forward_generation_raw(
-        engine: Engine,
-        prompts: Union[List[str], List[torch.Tensor]],
-        max_new_tokens: int = 8,
-        lora_paths: Optional[List[str]] = None,
-        logprob_start_len: int = 0,
-        top_k: Optional[int] = None,
-        token_ids_logprob: Optional[List[int]] = None,
-    ):
-        # the return value contains logprobs from prefill
-        output_strs = []
-        output_ids = []
-        # Input logprobs. Note that the last item in input logprob is equivalent to
-        # the first item in the output logprob.
-        top_input_logprobs = []
-        input_token_logprobs_lst = []
-        top_output_logprobs = []
-        output_token_logprobs_lst = []
-        top_output_logprob_idx = []
-        if token_ids_logprob is not None:
-            token_ids_input_logprobs = []
-            token_ids_output_logprobs = []
-        else:
-            token_ids_input_logprobs = token_ids_output_logprobs = None
-
-        sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
-        if top_k:
-            sampling_params["top_k"] = top_k
-
-        for i, prompt in enumerate(prompts):
-            response = engine.generate(
-                prompt,
-                lora_path=lora_paths[i] if lora_paths else None,
-                sampling_params=sampling_params,
-                return_logprob=True,
-                logprob_start_len=logprob_start_len,
-                top_logprobs_num=NUM_TOP_LOGPROBS,
-                token_ids_logprob=token_ids_logprob,
-            )
-            text = response["text"]
-
-            # Check if the text is empty or only whitespace.
-            if not text.strip():
-                raise ValueError(
-                    "Received an empty text response. Please verify your input or model configuration."
-                )
-            output_strs.append(text)
-            # output_ids.append(response["output_ids"])
-
-            input_token_logprobs = response["meta_info"]["input_token_logprobs"]
-            output_token_logprobs = response["meta_info"]["output_token_logprobs"]
-            # print(i, input_token_logprobs)
-            # print(i, output_token_logprobs)
-            logprobs = response["meta_info"]["input_top_logprobs"]
-            if token_ids_logprob is not None:
-                input_token_ids_logprobs = response["meta_info"][
-                    "input_token_ids_logprobs"
-                ][1:]
-            else:
-                input_token_ids_logprobs = None
-
-            num_prompt_tokens = response["meta_info"]["prompt_tokens"]
-            assert len(input_token_logprobs) == num_prompt_tokens - logprob_start_len
-            assert len(logprobs) == num_prompt_tokens - logprob_start_len
-
-            # The first token logprob has no meaning in sglang.
-            input_token_logprobs = input_token_logprobs[1:]
-            logprobs = logprobs[1:]
-            assert len(input_token_logprobs) == len(logprobs)
-
-            input_token_logprobs_lst.append(
-                input_token_logprobs + [output_token_logprobs[0]]
-            )
-            output_token_logprobs_lst.append(output_token_logprobs)
-
-            top_input_logprobs.append(
-                [[tup[0] for tup in x[:NUM_TOP_LOGPROBS]] for x in logprobs]
-                + [
-                    [
-                        tup[0]
-                        for tup in response["meta_info"]["output_top_logprobs"][0][
-                            :NUM_TOP_LOGPROBS
-                        ]
-                    ]
-                ]
-            )
-            top_output_logprobs.append(
-                [
-                    [tup[0] for tup in x[:NUM_TOP_LOGPROBS]]
-                    for x in response["meta_info"]["output_top_logprobs"]
-                ]
-            )
-            top_output_logprob_idx.append(
-                [
-                    [tup[1] for tup in x[:NUM_TOP_LOGPROBS]]
-                    for x in response["meta_info"]["output_top_logprobs"]
-                ]
-            )
-            if token_ids_logprob is not None:
-                token_ids_input_logprobs.append(
-                    [[tup[0] for tup in x] for x in input_token_ids_logprobs]
-                    + [
-                        [
-                            tup[0]
-                            for tup in response["meta_info"][
-                                "output_token_ids_logprobs"
-                            ][0]
-                        ]
-                    ]
-                )
-                token_ids_output_logprobs.append(
-                    [
-                        [tup[0] for tup in x]
-                        for x in response["meta_info"]["output_token_ids_logprobs"]
-                    ]
-                )
-
-        return ModelOutput(
-            output_strs=output_strs,
-            output_ids=output_ids,
-            top_input_logprobs=top_input_logprobs,
-            top_output_logprobs=top_output_logprobs,
-            input_token_logprobs_lst=input_token_logprobs_lst,
-            output_token_logprobs_lst=output_token_logprobs_lst,
-            top_output_logprob_idx=top_output_logprob_idx,
-            token_ids_input_logprobs=token_ids_input_logprobs,
-            token_ids_output_logprobs=token_ids_output_logprobs,
-        )
-
-    @staticmethod
-    def batch_forward_generation_raw(
-        prompts: Union[List[str], List[torch.Tensor]],
-        max_new_tokens,
-        lora_paths,
-        engine,
-    ):
-        # the return value contains logprobs from prefill
-        output_strs = []
-        sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
-        response = engine.generate(
-            prompts,
-            lora_path=lora_paths if lora_paths else None,
-            sampling_params=sampling_params,
-        )
-        output_strs = [r["text"] for r in response]
-
-        return ModelOutput(
-            output_strs=output_strs,
-        )
 
 
 def monkey_patch_gemma2_sdpa():

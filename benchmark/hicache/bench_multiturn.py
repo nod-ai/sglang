@@ -5,7 +5,6 @@ import queue
 import random
 import threading
 import time
-from datetime import datetime
 from typing import Optional
 
 import aiohttp
@@ -27,14 +26,8 @@ def parse_args():
     parser.add_argument(
         "--num-clients",
         type=int,
-        default=256,
+        default=200,
         help="Number of concurrent clients",
-    )
-    parser.add_argument(
-        "--max-parallel",
-        type=int,
-        default=128,
-        help="Maximum number of parallel requests",
     )
     parser.add_argument(
         "--request-length",
@@ -80,22 +73,10 @@ def parse_args():
         help="Server port (default: 30000)",
     )
     parser.add_argument(
-        "--model-path",
+        "--model",
         type=str,
         default="meta-llama/Llama-3.1-8B-Instruct",
         help="model path compatible with Hugging Face Transformers",
-    )
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default="",
-        help="local dataset to sample tokens from",
-    )
-    parser.add_argument(
-        "--log-file",
-        type=str,
-        default="performance_metrics.jsonl",
-        help="File to log performance metrics",
     )
     return parser.parse_args()
 
@@ -177,18 +158,6 @@ def gen_payload(prompt, output_len):
     return payload
 
 
-def log_to_jsonl_file(data, file_path="performance_metrics.jsonl"):
-    """Append the data with a timestamp to the specified JSONL file."""
-    timestamped_data = {"timestamp": datetime.now().isoformat(), **data}
-    try:
-        with open(file_path, "a") as file:
-            file.write(
-                json.dumps(timestamped_data) + "\n"
-            )  # Write as a single line in JSONL format
-    except IOError as e:
-        print(f"Error writing to JSONL file: {e}")
-
-
 class ReadyQueue:
     """
     Thread-safe queue that can pop requests in different orders based on given policy.
@@ -222,14 +191,11 @@ class WorkloadGenerator:
         # Construct the base URL for requests
         self.url = f"http://{args.host}:{args.port}/generate"
 
-        self.tokenizer = get_tokenizer(args.model_path)
+        self.tokenizer = get_tokenizer(args.model)
         self.distribution = args.distribution
         self.request_rate = args.request_rate
         self.start_time = None
         self.finished_time = None
-
-        self.sent_requests = 0
-        self.completed_requests = 0
 
         self.candidate_inputs = sample_random_requests(
             input_len=args.request_length,
@@ -237,7 +203,7 @@ class WorkloadGenerator:
             num_prompts=args.num_clients * args.num_rounds,
             range_ratio=1.0,
             tokenizer=self.tokenizer,
-            dataset_path=args.dataset_path,
+            dataset_path="",
         )
         self.candidate_inputs = [i[0] for i in self.candidate_inputs]
 
@@ -261,7 +227,7 @@ class WorkloadGenerator:
             client_id, payload = item
             response = await async_request_sglang_generate(payload, self.url, self.pbar)
             if self.pbar.n == self.pbar.total:
-                self.finished_time = time.perf_counter()
+                self.finished_time = time.time()
             self.response_queue.put((client_id, response))
         except Exception as e:
             print(f"Request failed: {e}")
@@ -269,18 +235,6 @@ class WorkloadGenerator:
     def request_sender(self):
         async def request_loop():
             while True:
-                if self.sent_requests - self.completed_requests < args.max_parallel:
-                    new_request = self.ready_queue.pop()
-                    if new_request:
-                        asyncio.create_task(self.handle_request(new_request))
-                        self.sent_requests += 1
-                else:
-                    await asyncio.sleep(0.05)
-                    continue
-
-                if self.pbar.n == self.pbar.total:
-                    break
-
                 # Calculate Poisson-distributed wait time
                 if self.distribution == "poisson":
                     sleep_time = random.expovariate(self.request_rate)
@@ -292,6 +246,14 @@ class WorkloadGenerator:
                 else:
                     raise ValueError("Invalid distribution type")
                 await asyncio.sleep(sleep_time)  # Wait before sending the next request
+
+                new_request = self.ready_queue.pop()
+                # Submit async request
+                if new_request:
+                    asyncio.create_task(self.handle_request(new_request))
+                else:
+                    if self.pbar.n == self.pbar.total:
+                        break
 
         # Create and run the event loop for asynchronous requests
         loop = asyncio.new_event_loop()
@@ -311,7 +273,6 @@ class WorkloadGenerator:
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
                 self.performance_metrics["latency"].append(response.latency)
-                self.completed_requests += 1
 
                 if self.client_records[client_id]["round"] < args.num_rounds:
                     self.client_records[client_id][
@@ -334,62 +295,40 @@ class WorkloadGenerator:
         request_thread = threading.Thread(target=self.request_sender, daemon=True)
         response_thread = threading.Thread(target=self.response_handler, daemon=True)
 
-        self.start_time = time.perf_counter()
+        self.start_time = time.time()
         request_thread.start()
         response_thread.start()
 
         request_thread.join()
         response_thread.join()
-        self.pbar.close()
 
-        performance_data = {
-            "summary": {
-                "total_requests": len(self.performance_metrics["ttft"]),
-                "request_rate": self.request_rate,
-                "average_ttft": sum(self.performance_metrics["ttft"])
-                / len(self.performance_metrics["ttft"]),
-                "p90_ttft": sorted(self.performance_metrics["ttft"])[
-                    int(0.9 * len(self.performance_metrics["ttft"]))
-                ],
-                "median_ttft": sorted(self.performance_metrics["ttft"])[
-                    len(self.performance_metrics["ttft"]) // 2
-                ],
-                "average_latency": sum(self.performance_metrics["latency"])
-                / len(self.performance_metrics["latency"]),
-                "p90_latency": sorted(self.performance_metrics["latency"])[
-                    int(0.9 * len(self.performance_metrics["latency"]))
-                ],
-                "median_latency": sorted(self.performance_metrics["latency"])[
-                    len(self.performance_metrics["latency"]) // 2
-                ],
-                "throughput": self.pbar.total / (self.finished_time - self.start_time),
-            },
-        }
-        print("All requests completed")
+        self.pbar.close()
+        print("All requests completed.")
         print("Performance metrics summary:")
         print(
-            f"  Total requests: {performance_data['summary']['total_requests']} at {performance_data['summary']['request_rate']} requests per second"
+            f"  Total requests: {len(self.performance_metrics['ttft'])} at {self.request_rate} requests per second"
         )
-        print(f"  Average TTFT: {performance_data['summary']['average_ttft']:.2f}")
-        print(f"  P90 TTFT: {performance_data['summary']['p90_ttft']:.2f}")
-        print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
         print(
-            f"  Average latency: {performance_data['summary']['average_latency']:.2f}"
+            f"  Average TTFT: {sum(self.performance_metrics['ttft']) / len(self.performance_metrics['ttft']):.2f}"
         )
-        print(f"  P90 latency: {performance_data['summary']['p90_latency']:.2f}")
-        print(f"  Median latency: {performance_data['summary']['median_latency']:.2f}")
         print(
-            f"  Throughput: {performance_data['summary']['throughput']:.2f} requests per second"
+            f"  Median TTFT: {sorted(self.performance_metrics['ttft'])[len(self.performance_metrics['ttft']) // 2]:.2f}"
         )
-        log_to_jsonl_file(performance_data, args.log_file)
+        print(
+            f"  Average latency: {sum(self.performance_metrics['latency']) / len(self.performance_metrics['latency']):.2f}"
+        )
+        print(
+            f"  Median latency: {sorted(self.performance_metrics['latency'])[len(self.performance_metrics['latency']) // 2]:.2f}"
+        )
+        throughput = self.pbar.total / (self.finished_time - self.start_time)
+        print(f"Throughput: {throughput:.2f} requests per second")
 
 
 if __name__ == "__main__":
     args = parse_args()
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
-    for request_rate in [16, 14, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]:
+    for request_rate in range(1, 41, 2):
         args.request_rate = request_rate
         requests.post(flush_cache_url)
-        time.sleep(1)
         WorkloadGenerator(args).run()

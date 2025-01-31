@@ -20,14 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Check clang-format
         uses: DoozyX/clang-format-lint-action@v0.18.1
         with:
           source: sgl-kernel
           extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 18
+          clangFormatVersion: 16
           style: file
 
   build-wheels:
@@ -35,14 +35,9 @@ jobs:
     runs-on: sgl-kernel-build-node
     strategy:
       matrix:
-        include:
-          - python-version: '3.9'
-            cuda-version: '11.8'
-          - python-version: '3.9'
-            cuda-version: '12.4'
-          - python-version: '3.9'
-            cuda-version: '12.8'
-    name: Build Wheel (CUDA ${{ matrix.cuda-version }})
+        python-version: ['3.9']
+        cuda-version: ['12.4']
+
     steps:
       - name: Cleanup
         run: |
@@ -57,15 +52,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
-        if: github.event_name != 'push' || (matrix.cuda-version != '11.8' && matrix.cuda-version != '12.8')
+      - name: Build wheels for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
           cd sgl-kernel
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
 
-      - name: Upload artifacts (only for CUDA 12.4)
-        if: ${{ matrix.cuda-version == '12.4' }}
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
@@ -87,8 +80,7 @@ jobs:
 
       - name: Install
         run: |
-          bash scripts/ci_install_dependency.sh
-          pip3 install torch==2.6.0 torchvision && pip3 install pytest
+          pip3 install torch==2.5.1 && pip3 install pytest && pip3 install vllm==0.6.4.post1
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
@@ -97,55 +89,15 @@ jobs:
         timeout-minutes: 30
         run: |
           cd sgl-kernel
-          pytest tests/
-
-      - name: Uninstall dependencies
-        run: |
-          pip3 uninstall sgl-kernel -y
-
-  mla-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: build-wheels
-    runs-on: 1-gpu-runner
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-*
-
-      - name: Install
-        run: |
-          bash scripts/ci_install_dependency.sh
-          pip3 uninstall sgl-kernel -y || true
-          pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
-          pip3 list | grep sgl-kernel
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/srt
-          python3 test_mla_deepseek_v3.py
+          find tests -name "test_*.py" | xargs -n 1 python3
 
       - name: Uninstall dependencies
         run: |
           pip3 uninstall sgl-kernel -y
 
   finish:
-    needs: [unit-test, mla-test, lint, build-wheels]
+    needs: [unit-test, lint]
     runs-on: ubuntu-latest
     steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."

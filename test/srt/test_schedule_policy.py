@@ -8,39 +8,28 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.test_utils import CustomTestCase
 
 
-class TestSchedulePolicy(CustomTestCase):
+class TestSchedulePolicy(unittest.TestCase):
 
     def setUp(self):
         self.tree_cache = RadixCache(None, None, False)
 
     def test_init_with_cache_aware_policy(self):
-        policy = SchedulePolicy(
-            policy="lpm", tree_cache=self.tree_cache, enable_hierarchical_cache=True
-        )
+        policy = SchedulePolicy(policy="lpm", tree_cache=self.tree_cache)
         self.assertEqual(policy.policy, CacheAwarePolicy.LPM)
 
     def test_init_with_cache_agnostic_policy(self):
-        policy = SchedulePolicy(
-            policy="fcfs", tree_cache=self.tree_cache, enable_hierarchical_cache=True
-        )
+        policy = SchedulePolicy(policy="fcfs", tree_cache=self.tree_cache)
         self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
 
     def test_init_with_unknown_policy(self):
         with self.assertRaises(ValueError):
-            SchedulePolicy(
-                policy="invalid",
-                tree_cache=self.tree_cache,
-                enable_hierarchical_cache=True,
-            )
+            SchedulePolicy(policy="invalid", tree_cache=self.tree_cache)
 
     def test_init_with_disabled_cache(self):
-        disabled_tree_cache = RadixCache(None, None, disable=True, page_size=1)
-        policy = SchedulePolicy(
-            policy="lpm", tree_cache=disabled_tree_cache, enable_hierarchical_cache=True
-        )
+        disabled_tree_cache = RadixCache(None, None, disable=True)
+        policy = SchedulePolicy(policy="lpm", tree_cache=disabled_tree_cache)
         self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
 
     def test_calc_priority_fcfs(self):
@@ -51,9 +40,7 @@ class TestSchedulePolicy(CustomTestCase):
             Req(2, "a", [1], SamplingParams()),
         ]
 
-        policy = SchedulePolicy(
-            policy="fcfs", tree_cache=tree_cache, enable_hierarchical_cache=True
-        )
+        policy = SchedulePolicy(policy="fcfs", tree_cache=tree_cache)
         policy.calc_priority(waiting_queue)
         # Check if FCFS keeps the original order
         self.assertEqual(waiting_queue[0].rid, 1)

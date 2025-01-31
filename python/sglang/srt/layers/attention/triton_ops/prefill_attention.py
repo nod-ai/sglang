@@ -176,7 +176,7 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
+    if is_cuda_available and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
     else:
         BLOCK = 64

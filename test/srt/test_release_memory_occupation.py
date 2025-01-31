@@ -5,13 +5,13 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = True
 
 
-class TestReleaseMemoryOccupation(CustomTestCase):
+class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_release_and_resume_occupation(self):
         prompt = "Today is a sunny day and I like"
         sampling_params = {"temperature": 0, "max_new_tokens": 8}
@@ -42,10 +42,10 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         )
 
         print("release_memory_occupation start")
-        t = time.perf_counter()
+        t = time.time()
         engine.release_memory_occupation()
         if _DEBUG_EXTRA:
-            print("release_memory_occupation", time.perf_counter() - t)
+            print("release_memory_occupation", time.time() - t)
 
         if _DEBUG_EXTRA:
             time.sleep(5)
@@ -60,10 +60,10 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             time.sleep(5)
 
         print("resume_memory_occupation start")
-        t = time.perf_counter()
+        t = time.time()
         engine.resume_memory_occupation()
         if _DEBUG_EXTRA:
-            print("resume_memory_occupation", time.perf_counter() - t)
+            print("resume_memory_occupation", time.time() - t)
 
         self.assertEqual(
             _try_allocate_big_tensor(),

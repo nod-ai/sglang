@@ -21,7 +21,9 @@ class Shortfin(BaseBackend):
         if base_url is None:
             raise ValueError("`base_url` is required for Shortfin backend")
 
-        self.chat_template = chat_template or get_chat_template_by_model_path("default")
+        self.chat_template = chat_template or get_chat_template_by_model_path(
+            "llama-3-instruct"
+        )
 
         self.client_params = {"base_url": base_url, "timeout": timeout}
 
@@ -41,7 +43,7 @@ class Shortfin(BaseBackend):
     def _clean_response_message_stream(self, text):
         # return text.replace(b"data: ", b"").strip(b"\n")
         prefix_removed = re.sub(rb"^data.*?:\s", b"", text)
-        return re.sub(rb"\n\n$", b"", prefix_removed)
+        return re.sub(rb"\n\n$", b"", prefix_removed).decode("utf-8")
 
     def _process_generation_response(self, req_output: dict):
         prompt_response = req_output["responses"][0]
@@ -93,4 +95,4 @@ class Shortfin(BaseBackend):
                 break
             text = self._clean_response_message_stream(chunk)
             if text is not None:
-                yield text.decode("utf-8"), {}
+                yield text, {}

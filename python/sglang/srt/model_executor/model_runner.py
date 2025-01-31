@@ -20,8 +20,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -31,13 +30,15 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.distributed import (
     get_tp_group,
-    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -77,11 +78,6 @@ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
-from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -93,11 +89,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     init_custom_process_group,
     is_cuda,
-    is_fa3_default_architecture,
-    is_flashinfer_available,
     is_hip,
-    is_hopper_with_cuda_12_3,
-    is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
@@ -143,8 +135,6 @@ class ModelRunner:
         nccl_port: int,
         server_args: ServerArgs,
         is_draft_worker: bool = False,
-        req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.model_config = model_config
@@ -164,23 +154,59 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
-        self.is_multimodal_chunked_prefill_supported = (
-            model_config.is_multimodal_chunked_prefill_supported
-        )
+        self.should_log = tp_rank == 0
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.page_size = server_args.page_size
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
-        self.attention_chunk_size = model_config.attention_chunk_size
-
-        self.forward_pass_id = 0
 
         # Model-specific adjustment
-        self.model_specific_adjustment()
+        if (
+            self.model_config.attention_arch == AttentionArch.MLA
+            and not self.server_args.disable_mla
+        ):
+            # TODO: add MLA optimization on CPU
+            if self.server_args.device != "cpu":
+                logger.info("MLA optimization is turned on. Use triton backend.")
+                self.server_args.attention_backend = "triton"
 
+        if self.server_args.enable_double_sparsity:
+            logger.info(
+                "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
+            )
+            self.server_args.attention_backend = "triton"
+            self.server_args.disable_cuda_graph = True
+            if self.server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(
+                self.server_args.ds_heavy_channel_type
+            )
+
+        if self.is_multimodal:
+            self.mem_fraction_static *= 0.95
+            logger.info(
+                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
+                f"because this is a multimodal model."
+            )
+
+            if self.model_config.hf_config.architectures == [
+                "MllamaForConditionalGeneration"
+            ]:
+                logger.info("Automatically turn off --chunked-prefill-size for mllama.")
+                server_args.chunked_prefill_size = -1
+
+            if self.model_config.hf_config.architectures == [
+                "Qwen2VLForConditionalGeneration"
+            ]:
+                # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
+                logger.info(
+                    "Automatically turn off --chunked-prefill-size and disable radix cache for qwen2-vl."
+                )
+                server_args.chunked_prefill_size = -1
+                server_args.disable_radix_cache = True
+
+        # Global vars
         if server_args.show_time_cost:
             enable_show_time_cost()
 
@@ -199,20 +225,7 @@ class ModelRunner:
                 "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
                 "enable_dp_lm_head": server_args.enable_dp_lm_head,
                 "enable_ep_moe": server_args.enable_ep_moe,
-                "enable_deepep_moe": server_args.enable_deepep_moe,
-                "deepep_config": server_args.deepep_config,
-                "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
-                "moe_dense_tp_size": server_args.moe_dense_tp_size,
-                "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
-                "n_share_experts_fusion": server_args.n_share_experts_fusion,
-                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "torchao_config": server_args.torchao_config,
-                "sampling_backend": server_args.sampling_backend,
-                "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
-                "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "use_mla_backend": self.use_mla_backend,
-                "mm_attention_backend": server_args.mm_attention_backend,
-                "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
+                "device": server_args.device,
             }
         )
 
@@ -222,59 +235,13 @@ class ModelRunner:
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
-        # Update deep gemm configure
-        if _ENABLE_JIT_DEEPGEMM:
-            update_deep_gemm_config(gpu_id, server_args)
-
-        # If it is a draft model, tp_group can be different
-        self.initialize(min_per_gpu_memory)
-
-        # temporary cached values
-        self.support_pp = (
-            "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
-        )
-
-    def initialize(self, min_per_gpu_memory: float):
-        server_args = self.server_args
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
 
-        if not self.is_draft_worker:
-            set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(server_args, self.model_config)
-            )
-            if self.tp_rank == 0 and get_bool_env_var(
-                "SGLANG_LOG_EXPERT_LOCATION_METADATA"
-            ):
-                logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
-                )
-
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.tp_rank,
-                )
-            )
-
-        self.eplb_manager = (
-            EPLBManager(self)
-            if self.server_args.enable_eplb and (not self.is_draft_worker)
-            else None
-        )
-        self.expert_location_updater = ExpertLocationUpdater()
-
         # Load the model
         self.sampler = Sampler()
         self.load_model()
-
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(
-            self.model, "end_layer", self.model_config.num_hidden_layers
-        )
-        self.num_effective_layers = self.end_layer - self.start_layer
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -289,7 +256,7 @@ class ModelRunner:
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
 
-        # Init lora
+        # Init memory pool and attention backends
         if server_args.lora_paths is not None:
             self.init_lora_manager()
 
@@ -432,24 +399,17 @@ class ModelRunner:
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
-        try:
-            torch.get_device_module(self.device).set_device(self.gpu_id)
-        except Exception:
-            logger.warning(
-                f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"
-            )
-            raise
-
+        torch.get_device_module(self.device).set_device(self.gpu_id)
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "xpu":
-            backend = "xccl"
+            # TODO(liangan1): Just use gloo to bypass the initilization fail
+            # Need to use xccl for xpu backend in the future
+            backend = "gloo"
         elif self.device == "hpu":
             backend = "hccl"
         elif self.device == "cpu":
             backend = "gloo"
-        elif self.device == "npu":
-            backend = "hccl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -465,23 +425,17 @@ class ModelRunner:
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
-                world_size=self.tp_size * self.pp_size,
-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+                world_size=self.tp_size,
+                rank=self.tp_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
-                timeout=self.server_args.dist_timeout,
             )
-            initialize_model_parallel(
-                tensor_model_parallel_size=self.tp_size,
-                pipeline_model_parallel_size=self.pp_size,
-            )
+            initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
-                moe_dense_tp_size=self.server_args.moe_dense_tp_size,
-                pp_size=self.server_args.pp_size,
             )
 
         min_per_gpu_memory = get_available_gpu_memory(
@@ -532,8 +486,6 @@ class ModelRunner:
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
 
-        set_cuda_arch()
-
         # Prepare the model config
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
@@ -545,8 +497,6 @@ class ModelRunner:
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
-        monkey_patch_isinstance_for_vllm_base_layer()
-
         with self.memory_saver_adapter.region():
             self.model = get_model(
                 model_config=self.model_config,
@@ -554,7 +504,6 @@ class ModelRunner:
                 device_config=DeviceConfig(self.device),
             )
         monkey_patch_vllm_parallel_state(reverse=True)
-        monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -596,17 +545,16 @@ class ModelRunner:
             f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
         )
 
-        # Handle the case where some ranks do not finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
+    def update_weights_from_disk(
+        self, model_path: str, load_format: str
+    ) -> tuple[bool, str]:
+        """Update engine weights in-place from the disk."""
+        from sglang.srt.model_loader.loader import (
+            DefaultModelLoader,
+            device_loading_context,
+            get_model_loader,
+        )
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
     def update_expert_location(
         self, new_expert_location_metadata: ExpertLocationMetadata
@@ -751,21 +699,8 @@ class ModelRunner:
             logger.error(error_msg)
             return False, error_msg
 
-    def update_weights_from_tensor(
-        self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
-        load_format: Optional[str] = None,
-    ):
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank))
-            for name, tensor in named_tensors
-        ]
-        if load_format == "direct":
-            _model_load_weights_direct(self.model, named_tensors)
-        elif load_format is None:
-            self.model.load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
+    def update_weights_from_tensor(self, named_tensors: List[Tuple[str, torch.Tensor]]):
+        self.model.load_weights(named_tensors)
         return True, "Success"
 
     def get_weights_by_name(
@@ -870,31 +805,15 @@ class ModelRunner:
                 4096,
             )
 
-        if SGLANG_CI_SMALL_KV_SIZE:
-            self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
-
         if not self.spec_algorithm.is_none():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                max_num_reqs = self.server_args.max_num_reqs
             else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
                 self.server_args.draft_runner_cache_size = (
                     self.max_total_num_tokens
-                    # draft
-                    + max_num_reqs
-                    * self.server_args.speculative_num_steps
-                    * self.server_args.speculative_eagle_topk
-                    # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
+                    + max_num_reqs * self.server_args.speculative_num_steps
                     + 100
                 )
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                self.server_args.max_num_reqs = max_num_reqs
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
@@ -905,10 +824,16 @@ class ModelRunner:
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
-        self.max_total_num_tokens = (
-            self.max_total_num_tokens
-            // self.server_args.page_size
-            * self.server_args.page_size
+        if self.max_total_num_tokens <= 0:
+            raise RuntimeError(
+                "Not enough memory. Please try to increase --mem-fraction-static."
+            )
+
+        self.req_to_token_pool = ReqToTokenPool(
+            size=max_num_reqs + 1,
+            max_context_len=self.model_config.context_len + 4,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
         )
 
         if self.max_total_num_tokens <= 0:
@@ -941,8 +866,6 @@ class ModelRunner:
                 ),  # PP is not compatible with mla backend
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
             )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(
@@ -955,8 +878,6 @@ class ModelRunner:
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
                 enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -968,8 +889,6 @@ class ModelRunner:
                 layer_num=self.num_effective_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
             )
 
         if self.token_to_kv_pool_allocator is None:
@@ -1136,9 +1055,7 @@ class ModelRunner:
         device_mesh = torch.distributed.init_device_mesh(self.device, (self.tp_size,))
         tensor_parallel(self.model, device_mesh)
 
-    def forward_decode(
-        self, forward_batch: ForwardBatch, pp_proxy_tensors=None
-    ) -> LogitsProcessorOutput:
+    def forward_decode(self, forward_batch: ForwardBatch):
         self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
@@ -1200,30 +1117,21 @@ class ModelRunner:
                 forward_batch, skip_attn_backend_init, pp_proxy_tensors
             )
 
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+    def forward_idle(self, forward_batch: ForwardBatch):
+        return self.model.forward(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
+        )
 
-        return output
-
-    def _forward_raw(
-        self,
-        forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-    ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        can_run_cuda_graph = bool(
+    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        if (
             forward_batch.forward_mode.is_cuda_graph()
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
-        )
-        if can_run_cuda_graph:
-            ret = self.cuda_graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+        ):
+            return self.cuda_graph_runner.replay(forward_batch)
+
+        if forward_batch.forward_mode.is_decode():
+            return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
                 forward_batch,
@@ -1235,12 +1143,11 @@ class ModelRunner:
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-        return ret, can_run_cuda_graph
-
-    def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
-    ):
+    def sample(
+        self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
         # Apply logit bias
+        sampling_info = forward_batch.sampling_info
         if sampling_info.sampling_info_done:
             # Overlap mode: the function update_regex_vocab_mask was executed
             # in process_batch_result of the last batch.
@@ -1249,38 +1156,15 @@ class ModelRunner:
         else:
             # Normal mode: Put CPU-heavy tasks here. They will be overlapped with the forward pass.
             sampling_info.update_regex_vocab_mask()
+            sampling_info.update_penalties()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
-
-    def sample(
-        self,
-        logits_output: LogitsProcessorOutput,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """Sample and compute logprobs and update logits_output.
-
-        Args:
-            logits_output: The logits output from the model forward
-            forward_batch: The forward batch that generates logits_output
-
-        Returns:
-            A list of next_token_ids
-        """
-        # For duplex models with multiple output streams.
-        if isinstance(logits_output, tuple):
-            return torch.stack(
-                [self.sample(values, forward_batch) for values in logits_output],
-                axis=-1,
-            )
-
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
-            forward_batch.sampling_info,
+            sampling_info,
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
         )
         return next_token_ids
 

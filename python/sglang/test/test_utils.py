@@ -42,50 +42,16 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST = "Qwen/Qwen1.5-MoE-A2.7B"
 # MLA test models
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
-DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
-DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
-
-# FP8 models
-DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
-DEFAULT_MODEL_NAME_FOR_ACCURACY_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
-DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8 = (
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
-)
-DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
-    "nvidia/Llama-3.1-8B-Instruct-FP8"
-)
-
-# EAGLE
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
-
-# Other use cases
-DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
-    "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-)
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
-DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
-DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
-    "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
-)
-DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
-
-# Nightly tests
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = "meta-llama/Llama-3.1-8B-Instruct,mistralai/Mistral-7B-Instruct-v0.3,deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct,google/gemma-2-27b-it"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "meta-llama/Llama-3.1-70B-Instruct,mistralai/Mixtral-8x7B-Instruct-v0.1,Qwen/Qwen2-57B-A14B-Instruct"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8,neuralmagic/Mistral-7B-Instruct-v0.3-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8,neuralmagic/gemma-2-2b-it-FP8"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8,neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8,neuralmagic/Qwen2-72B-Instruct-FP8,neuralmagic/Qwen2-57B-A14B-Instruct-FP8,neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4,hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4,hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
-DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
-DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST = "qwen2-vl"
 
-DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
-DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
-
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
+DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmzheng/sglang-EAGLE-llama2-chat-7B"
 
 
 def is_in_ci():
@@ -619,15 +585,11 @@ def get_benchmark_args(
     dataset_path="",
     tokenizer="",
     num_prompts=500,
-    sharegpt_output_len=None,
     random_input_len=4096,
     random_output_len=2048,
-    sharegpt_context_len=None,
     request_rate=float("inf"),
     disable_stream=False,
     disable_ignore_eos=False,
-    seed: int = 0,
-    pd_separated: bool = False,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -639,8 +601,8 @@ def get_benchmark_args(
         model=None,
         tokenizer=tokenizer,
         num_prompts=num_prompts,
-        sharegpt_output_len=sharegpt_output_len,
-        sharegpt_context_len=sharegpt_context_len,
+        sharegpt_output_len=None,
+        sharegpt_context_len=None,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
         random_range_ratio=0.0,
@@ -650,14 +612,12 @@ def get_benchmark_args(
         disable_tqdm=False,
         disable_stream=disable_stream,
         return_logprob=False,
-        seed=seed,
+        seed=0,
         disable_ignore_eos=disable_ignore_eos,
         extra_request_body=None,
         apply_chat_template=False,
         profile=None,
         lora_name=None,
-        prompt_suffix="",
-        pd_separated=pd_separated,
     )
 
 
@@ -695,11 +655,9 @@ def run_bench_serving(
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
-        sharegpt_context_len=sharegpt_context_len,
         request_rate=request_rate,
         disable_stream=disable_stream,
         disable_ignore_eos=disable_ignore_eos,
-        seed=seed,
     )
 
     try:
@@ -721,7 +679,6 @@ def run_bench_serving_multi(
     other_server_args,
     benchmark_args,
     need_warmup=False,
-    pd_separated=False,
 ):
     # Launch the server
     process = popen_launch_server(
@@ -729,7 +686,6 @@ def run_bench_serving_multi(
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_server_args,
-        pd_separated=pd_separated,
     )
 
     # run benchmark for all
@@ -888,17 +844,13 @@ STDOUT_FILENAME = "/tmp/stdout.txt"
 def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
     """Print the output in real time with another thread."""
     while not os.path.exists(filename):
-        time.sleep(0.01)
+        time.sleep(1)
 
     pt = 0
     while pt >= 0:
         if pt > 0 and not os.path.exists(filename):
             break
-        try:
-            lines = open(filename).readlines()
-        except FileNotFoundError:
-            print(f"{pt=}, {os.path.exists(filename)=}")
-            raise
+        lines = open(filename).readlines()
         for line in lines[pt:]:
             print(line, end="", flush=True)
             output_lines.append(line)
@@ -983,7 +935,7 @@ def run_command_and_capture_output(command, env: Optional[dict] = None):
     stdout = open(STDOUT_FILENAME, "w")
     stderr = open(STDERR_FILENAME, "w")
     process = subprocess.Popen(
-        command, stdout=stdout, stderr=stdout, env=env, text=True
+        command, stdout=stdout, stderr=stderr, env=env, text=True
     )
 
     # Launch a thread to stream the output

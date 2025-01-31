@@ -32,27 +32,15 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.srt.configs import (
-    ChatGLMConfig,
-    DbrxConfig,
-    DeepseekVL2Config,
-    ExaoneConfig,
-    KimiVLConfig,
-    MultiModalityConfig,
-)
-from sglang.srt.configs.internvl import InternVLChatConfig
-from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url
+from sglang.srt.configs import ChatGLMConfig, DbrxConfig, ExaoneConfig, Qwen2VLConfig
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
     DbrxConfig.model_type: DbrxConfig,
     ExaoneConfig.model_type: ExaoneConfig,
-    DeepseekVL2Config.model_type: DeepseekVL2Config,
-    MultiModalityConfig.model_type: MultiModalityConfig,
-    KimiVLConfig.model_type: KimiVLConfig,
-    InternVLChatConfig.model_type: InternVLChatConfig,
+    Qwen2VLConfig.model_type: Qwen2VLConfig,
 }
+
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):

@@ -18,17 +18,19 @@
 # LoRA layers class inheritance adapted from:
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
-import logging
+
 import re
-from typing import Dict, List
 
 import torch
 from torch import nn
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader
 
 logger = logging.getLogger(__name__)

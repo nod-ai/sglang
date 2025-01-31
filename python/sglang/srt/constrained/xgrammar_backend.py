@@ -20,6 +20,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from xgrammar import (
     CompiledGrammar,
+    Grammar,
     GrammarCompiler,
     GrammarMatcher,
     StructuralTagItem,
@@ -173,13 +174,34 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             matcher, self.vocab_size, ctx, self.override_stop_tokens, key_string
         )
 
-    def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
-        try:
-            if key_string == "$$ANY$$":
-                # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
-                ctx = self.grammar_compiler.compile_builtin_json_grammar()
-            else:
-                ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
+        key_type, key_string = key
+        if key_type == "json":
+            try:
+                if key_string == "$$ANY$$":
+                    ctx = self.grammar_compiler.compile_builtin_json_grammar()
+                else:
+                    ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
+            except RuntimeError as e:
+                logging.warning(
+                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
+                )
+                return None
+        elif key_type == "ebnf":
+            try:
+                ctx = self.grammar_compiler.compile_grammar(key_string)
+            except RuntimeError as e:
+                logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
+                return None
+        elif key_type == "regex":
+            try:
+                ctx = self.grammar_compiler.compile_grammar(
+                    Grammar.from_regex(key_string)
+                )
+            except RuntimeError as e:
+                logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+                return None
+        else:
+            raise ValueError(f"Invalid key_type: {key_type}")
 
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")

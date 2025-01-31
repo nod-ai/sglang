@@ -9,12 +9,11 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
 )
 
 
-class TestFp8KvcacheBase(CustomTestCase):
+class TestFp8KvcacheBase(unittest.TestCase):
     model_config = None
 
     @classmethod

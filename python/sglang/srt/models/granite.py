@@ -42,7 +42,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -63,14 +62,14 @@ class GraniteMLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
+            prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -134,14 +133,14 @@ class GraniteAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
+            prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
@@ -158,8 +157,6 @@ class GraniteAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -208,14 +205,14 @@ class GraniteDecoderLayer(nn.Module):
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+            prefix=f"{prefix}.self_attn",
         )
         self.mlp = GraniteMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -255,7 +252,6 @@ class GraniteModel(nn.Module):
         self,
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -267,10 +263,7 @@ class GraniteModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 GraniteDecoderLayer(
-                    config,
-                    i,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{i}", prefix),
+                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -307,23 +300,17 @@ class GraniteForCausalLM(nn.Module):
         self,
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = GraniteModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = GraniteModel(config, quant_config=quant_config)
         # If tie_word_embeddings == True, then input and output embeddings are
         # the same tensor. Enforce during object creation so that weights will
         # load correctly even if the LM head weights don't have a separate entry
         # in the state dict.
         self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
+            config.vocab_size, config.hidden_size, quant_config=quant_config
         )
         if self.config.tie_word_embeddings:
             self.lm_head.tie_weights(self.model.embed_tokens)

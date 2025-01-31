@@ -324,11 +324,7 @@ class RuntimeEndpoint(BaseBackend):
 
     def _assert_success(self, res):
         if res.status_code != 200:
-            try:
-                content = res.json()
-            except json.JSONDecodeError:
-                content = res.text
-            raise RuntimeError(content)
+            raise RuntimeError(res.json())
 
 
 def compute_normalized_prompt_logprobs(input_logprobs):
@@ -340,7 +336,7 @@ class Runtime:
     """
     A wrapper for the HTTP server.
     This is used for launching the server in a python program without
-    using the command line interface.
+    using the commond line interface.
 
     It is mainly used for the frontend language.
     You should use the Engine class if you want to do normal offline processing without the frontend language.

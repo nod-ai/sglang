@@ -39,7 +39,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -47,8 +47,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInfo, SpeculativeAlgorithm
 
 
 class ForwardMode(IntEnum):
@@ -79,7 +78,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
-            or self == ForwardMode.TARGET_VERIFY
+            or self == self.TARGET_VERIFY
         )
 
     def is_decode(self):
@@ -97,13 +96,6 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self):
         return self == ForwardMode.DRAFT_EXTEND
 
-    def is_extend_or_draft_extend_or_mixed(self):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.DRAFT_EXTEND
-            or self == ForwardMode.MIXED
-        )
-
     def is_cuda_graph(self):
         return (
             self == ForwardMode.DECODE
@@ -120,9 +112,7 @@ class ForwardMode(IntEnum):
 
 class CaptureHiddenMode(IntEnum):
     NULL = auto()
-    # Capture hidden states of all tokens.
     FULL = auto()
-    # Capture a hidden state of the last token.
     LAST = auto()
 
     def need_capture(self):
@@ -228,35 +218,75 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     # For DP attention
-    global_num_tokens_cpu: Optional[List[int]] = None
-    global_num_tokens_gpu: Optional[torch.Tensor] = None
-    # Has to be None when cuda graph is captured.
-    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
-    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    # for extend, local start pos and num tokens is different in logits processor
-    # this will be computed in get_dp_local_info
-    # this will be recomputed in LogitsMetadata.from_forward_batch
-    dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
-    dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
+    global_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
-    global_forward_mode: Optional[ForwardMode] = None
 
     # Speculative decoding
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: SpecInfo = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
-
-    # For padding
-    padded_static_len: int = -1  # -1 if not padded
-    num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
-    tbo_split_seq_index: Optional[int] = None
-    tbo_parent_token_range: Optional[Tuple[int, int]] = None
-    tbo_children: Optional[List["ForwardBatch"]] = None
+    def compute_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
+        device = model_runner.device
+        hf_config = model_runner.model_config.hf_config
+        mrope_positions_list = [None] * self.seq_lens.shape[0]
+        if self.forward_mode.is_decode():
+            for i, _ in enumerate(mrope_positions_list):
+                mrope_position_delta = (
+                    0
+                    if batch.image_inputs[i] is None
+                    else batch.image_inputs[i].mrope_position_delta
+                )
+                mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
+                    mrope_position_delta,
+                    int(self.seq_lens[i]) - 1,
+                    int(self.seq_lens[i]),
+                )
+        elif self.forward_mode.is_extend():
+            extend_start_loc_cpu = self.extend_start_loc.cpu().numpy()
+            for i, image_inputs in enumerate(batch.image_inputs):
+                extend_start_loc, extend_seq_len, extend_prefix_len = (
+                    extend_start_loc_cpu[i],
+                    batch.extend_seq_lens[i],
+                    batch.extend_prefix_lens[i],
+                )
+                if image_inputs is None:
+                    # text only
+                    mrope_positions = [
+                        [
+                            pos
+                            for pos in range(
+                                extend_prefix_len, extend_prefix_len + extend_seq_len
+                            )
+                        ]
+                    ] * 3
+                else:
+                    # TODO: current qwen2-vl do not support radix cache since mrope position calculation
+                    mrope_positions, mrope_position_delta = (
+                        MRotaryEmbedding.get_input_positions(
+                            input_tokens=self.input_ids[
+                                extend_start_loc : extend_start_loc + extend_seq_len
+                            ],
+                            image_grid_thw=image_inputs.image_grid_thws,
+                            vision_start_token_id=hf_config.vision_start_token_id,
+                            spatial_merge_size=hf_config.vision_config.spatial_merge_size,
+                            context_len=0,
+                        )
+                    )
+                    batch.image_inputs[i].mrope_position_delta = mrope_position_delta
+                mrope_positions_list[i] = mrope_positions
+
+        self.mrope_positions = torch.concat(
+            [torch.tensor(pos, device=device) for pos in mrope_positions_list],
+            axis=1,
+        )
+        self.mrope_positions = self.mrope_positions.to(torch.int64)
 
     @classmethod
     def init_new(
@@ -326,7 +356,6 @@ class ForwardBatch:
             )
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
-            TboForwardBatchPreparer.prepare(ret)
             return ret
 
         # Override the positions with spec_info
@@ -335,10 +364,6 @@ class ForwardBatch:
             and getattr(ret.spec_info, "positions", None) is not None
         ):
             ret.positions = ret.spec_info.positions
-
-        # Get seq_lens_cpu if needed
-        if ret.seq_lens_cpu is None:
-            ret.seq_lens_cpu = batch.seq_lens_cpu
 
         # Init position information
         if ret.forward_mode.is_decode():
@@ -354,9 +379,7 @@ class ForwardBatch:
             if support_triton(model_runner.server_args.attention_backend):
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
-                    ret.extend_prefix_lens,
-                    ret.extend_seq_lens,
-                    ret.extend_num_tokens,
+                    ret.extend_prefix_lens, ret.extend_seq_lens, ret.extend_num_tokens
                 )
             else:
                 positions, ret.extend_start_loc = compute_position_torch(
@@ -369,7 +392,7 @@ class ForwardBatch:
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
-            ret._compute_mrope_positions(model_runner, batch)
+            ret.compute_mrope_positions(model_runner, batch)
 
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
@@ -712,40 +735,3 @@ def compute_position_torch(
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
-
-
-@triton.jit
-def create_chunked_prefix_cache_kv_indices(
-    req_to_token_ptr,  # (max_batch, max_context_len,)
-    req_pool_indices_ptr,  # (batch_size,)
-    chunk_start_idx_ptr,  # (batch_size,)
-    chunk_seq_lens_ptr,  # (batch_size,)
-    chunk_cu_seq_lens_ptr,  # (batch_size + 1,)
-    chunk_kv_indices_ptr,  # (num_chunk_tokens,)
-    req_to_token_ptr_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(axis=0)
-
-    # find the req pool idx, this is for batch to token
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
-    chunk_kv_indices_offset = tl.load(chunk_cu_seq_lens_ptr + pid)
-
-    # get the token positions of current chunk
-    chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
-    chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
-
-    num_loop = tl.cdiv(chunk_seq_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < chunk_seq_len
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + chunk_start_pos
-            + offset,
-            mask=mask,
-        )
-        tl.store(
-            chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask
-        )

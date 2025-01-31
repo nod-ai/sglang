@@ -10,8 +10,8 @@ It is recommended to use uv to install the dependencies for faster installation:
 
 ```bash
 pip install --upgrade pip
-pip install uv
-uv pip install "sglang[all]>=0.4.6.post5"
+pip install sgl-kernel --force-reinstall --no-deps
+pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 ```
 
 **Quick Fixes to Common Problems**
@@ -27,14 +27,15 @@ uv pip install "sglang[all]>=0.4.6.post5"
 
 ```bash
 # Use the last release branch
-git clone -b v0.4.6.post5 https://github.com/sgl-project/sglang.git
+git clone -b v0.4.2.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
-pip install -e "python[all]"
+pip install sgl-kernel --force-reinstall --no-deps
+pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 ```
 
-Note: SGLang currently uses torch 2.6, so you need to install flashinfer for torch 2.6. If you want to install flashinfer separately, please refer to [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html).
+Note: Please check the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html) to install the proper version according to your PyTorch and CUDA versions. If you meet with issue like **ImportError: cannot import name `_grouped_size_compiled_for_decode_kernels`**, installing FlashInfer with some older version like 0.1.6 instead of the latest version could solve it.
 
 If you want to develop SGLang, it is recommended to use docker. Please refer to [setup docker container](https://github.com/sgl-project/sglang/blob/main/docs/developer/development_guide_using_docker.md#setup-docker-container) for guidance. The docker image is `lmsysorg/sglang:dev`.
 
@@ -42,13 +43,11 @@ Note: For AMD ROCm system with Instinct/MI GPUs, do following instead:
 
 ```bash
 # Use the last release branch
-git clone -b v0.4.6.post5 https://github.com/sgl-project/sglang.git
+git clone -b v0.4.2.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
-cd sgl-kernel
-python setup_rocm.py install
-cd ..
+pip install sgl-kernel --force-reinstall --no-deps
 pip install -e "python[all_hip]"
 ```
 
@@ -71,7 +70,7 @@ docker run --gpus all \
 Note: For AMD ROCm system with Instinct/MI GPUs, it is recommended to use `docker/Dockerfile.rocm` to build images, example and usage as below:
 
 ```bash
-docker build --build-arg SGL_BRANCH=v0.4.6.post5 -t v0.4.6.post5-rocm630 -f Dockerfile.rocm .
+docker build --build-arg SGL_BRANCH=v0.4.2.post1 -t v0.4.2.post1-rocm620 -f Dockerfile.rocm .
 
 alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/dri --ipc=host \
     --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -80,11 +79,11 @@ alias drun='docker run -it --rm --network=host --device=/dev/kfd --device=/dev/d
 drun -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<secret>" \
-    v0.4.6.post5-rocm630 \
+    v0.4.2.post1-rocm620 \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
 
 # Till flashinfer backend available, --attention-backend triton --sampling-backend pytorch are set by default
-drun v0.4.6.post5-rocm630 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
+drun v0.4.2.post1-rocm620 python3 -m sglang.bench_one_batch --batch-size 32 --input 1024 --output 128 --model amd/Meta-Llama-3.1-8B-Instruct-FP8-KV --tp 8 --quantization fp8
 ```
 
 ## Method 4: Using docker compose

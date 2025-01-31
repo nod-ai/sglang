@@ -5,20 +5,21 @@ from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
+from vllm.model_executor.custom_op import CustomOp
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.custom_op_util import register_custom_op
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, permute_weight, set_weight_attrs
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -27,12 +28,7 @@ else:
 
 import logging
 
-_is_hip = is_hip()
-
-if _is_hip:
-    from aiter import ActivationType
-    from aiter.fused_moe_bf16_asm import ck_moe_2stages
-    from aiter.ops.shuffle import shuffle_weight
+is_hip_ = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -104,14 +100,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
+        if is_hip_ and get_bool_env_var("CK_MOE"):
             layer.w13_weight = torch.nn.Parameter(
-                shuffle_weight(layer.w13_weight.data, (16, 16)),
+                permute_weight(layer.w13_weight.data),
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
             layer.w2_weight = torch.nn.Parameter(
-                shuffle_weight(layer.w2_weight.data, (16, 16)),
+                permute_weight(layer.w2_weight.data),
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
@@ -130,10 +126,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         return self.forward(
             x=x,
@@ -147,10 +139,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            inplace=inplace,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
 
     def forward_cuda(
@@ -166,10 +154,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -181,33 +165,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
         )
 
-        if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
-            assert not no_combine, "unsupported"
-            if apply_router_weight_on_input:
-                assert (
-                    topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-                _, topk = topk_weights.shape
-                assert (
-                    topk == 1
-                ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(
-                    topk_weights, dtype=torch.float32
-                )  # topk_weights must be FP32 (float32)
+        if is_hip_ and get_bool_env_var("CK_MOE"):
+            import ater
+            from ater.fused_moe import fused_experts_ck
 
-            return ck_moe_2stages(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                activation=(
-                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
-                ),
+            assert activation == "silu", f"{activation=} is not supported."
+
+            return fused_experts_ck(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
             )
         else:
             return fused_experts(
@@ -216,10 +187,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w2=layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                inplace=inplace and not no_combine,
+                inplace=True,
                 activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                no_combine=no_combine,
             )
 
     def forward_cpu(
@@ -234,7 +203,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
-        inplace: bool = True,
     ) -> torch.Tensor:
         return moe_forward_native(
             layer,
@@ -296,11 +264,7 @@ class FusedMoE(torch.nn.Module):
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
         use_presharded_weights: bool = False,
-        inplace: bool = True,
-        no_combine: bool = False,
-        routed_scaling_factor: Optional[float] = None,
     ):
         super().__init__()
 
@@ -325,11 +289,6 @@ class FusedMoE(torch.nn.Module):
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
         self.activation = activation
-        self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.use_presharded_weights = use_presharded_weights
-        self.inplace = inplace
-        self.no_combine = no_combine
-        self.local_num_experts = num_experts
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -349,6 +308,7 @@ class FusedMoE(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
+        self.use_presharded_weights = use_presharded_weights
 
     def _load_per_tensor_weight_scale(
         self,
@@ -654,8 +614,6 @@ class FusedMoE(torch.nn.Module):
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
             activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         if self.reduce_results and self.tp_size > 1:

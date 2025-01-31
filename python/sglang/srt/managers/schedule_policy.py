@@ -24,7 +24,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
@@ -69,29 +69,17 @@ class CacheAgnosticPolicy(Enum):
 class SchedulePolicy:
     Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
 
-    def __init__(
-        self,
-        policy: str,
-        tree_cache: BasePrefixCache,
-        enable_hierarchical_cache: bool,
-    ):
+    def __init__(self, policy: str, tree_cache: BasePrefixCache):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache(
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=None,
-            page_size=1,
-            disable=False,
+            req_to_token_pool=None, token_to_kv_pool=None, disable=False
         )
 
     def calc_priority(self, waiting_queue: List[Req]) -> bool:
-        if self.policy == CacheAgnosticPolicy.FCFS:
-            # A shortcut for FCFS
-            return
-
         policy = self._determine_active_policy(waiting_queue)
 
         prefix_computed = False
@@ -121,7 +109,7 @@ class SchedulePolicy:
         return prefix_computed
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
-        if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
+        if len(waiting_queue) > 128 and self.policy == CacheAwarePolicy.LPM:
             # Turn off the expensive prefix matching and sorting when the #queue is large.
             return CacheAgnosticPolicy.FCFS
         return self.policy
@@ -158,14 +146,9 @@ class SchedulePolicy:
             prefix_ids = r.adjust_max_prefix_ids()
 
             # NOTE: the prefix_indices must always be aligned with last_node
-            if self.enable_hierarchical_cache:
-                r.prefix_indices, r.last_node, r.last_node_global = (
-                    self.tree_cache.match_prefix(key=prefix_ids, include_evicted=True)
-                )
-            else:
-                r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
-                    rid=r.rid, key=prefix_ids
-                )
+            r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
+                rid=r.rid, key=prefix_ids
+            )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -269,7 +252,7 @@ class PrefillAdder:
     def __init__(
         self,
         tree_cache: BasePrefixCache,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool: BaseTokenToKVPool,
         running_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,
@@ -277,7 +260,7 @@ class PrefillAdder:
         mixed_with_decode_tokens: int = 0,
     ):
         self.tree_cache = tree_cache
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.token_to_kv_pool = token_to_kv_pool
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
@@ -309,7 +292,7 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         return (
-            self.token_to_kv_pool_allocator.available_size()
+            self.token_to_kv_pool.available_size()
             + self.tree_cache.evictable_size()
             - self.rem_total_token_offset
         )
@@ -317,7 +300,7 @@ class PrefillAdder:
     @property
     def cur_rem_tokens(self):
         return (
-            self.token_to_kv_pool_allocator.available_size()
+            self.token_to_kv_pool.available_size()
             + self.tree_cache.evictable_size()
             - self.cur_rem_token_offset
         )
@@ -468,9 +451,12 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if (
-                enable_hierarchical_cache
-                and req.last_node_global is not None
-                and req.last_node_global.evicted
+                self.rem_chunk_tokens is None
+                or input_tokens <= self.rem_chunk_tokens
+                or (
+                    req.return_logprob
+                    and req.logprob_start_len != len(req.origin_input_ids) - 1
+                )
             ):
                 req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
                     req.last_node_global, req.prefix_indices

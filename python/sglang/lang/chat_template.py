@@ -247,68 +247,6 @@ register_chat_template(
     )
 )
 
-register_chat_template(
-    ChatTemplate(
-        name="janus-pro",
-        default_system_prompt=None,
-        role_prefix_and_suffix={
-            "system": (
-                "",
-                "",
-            ),
-            "User": (
-                "<｜User｜>",
-                "",
-            ),
-            "assistant": (
-                "<｜Assistant｜>",
-                "<｜end▁of▁sentence｜>",
-            ),
-        },
-        stop_str=("<｜end▁of▁sentence｜>",),
-        image_token="<image_placeholder>\n",
-    )
-)
-
-# https://huggingface.co/openbmb/MiniCPM-o-2_6
-register_chat_template(
-    ChatTemplate(
-        name="minicpmo",
-        default_system_prompt=None,
-        role_prefix_and_suffix={
-            "system": ("", " "),
-            "user": ("user:", " "),
-            "assistant": ("assistant:", "</s>"),
-        },
-        stop_str=("<|im_end|>", "<|endoftext|>"),
-        image_token="(<image>./</image>)",
-        audio_token="(<audio>./</audio>)",
-    )
-)
-
-register_chat_template(
-    ChatTemplate(
-        name="janus",
-        default_system_prompt=None,
-        role_prefix_and_suffix={
-            "system": (
-                "",
-                "",
-            ),
-            "user": (
-                "<｜User｜>",
-                "",
-            ),
-            "assistant": (
-                "<｜Assistant｜>",
-                "<｜end▁of▁sentence｜>",
-            ),
-        },
-        stop_str=("<｜end▁of▁sentence｜>",),
-        image_token="<image_placeholder>\n",
-    )
-)
-
 # The difference between "llama-3-instruct-llava" and "llama-3-instruct" is that llava uses a different image_token.
 register_chat_template(
     ChatTemplate(
@@ -434,20 +372,6 @@ register_chat_template(
     )
 )
 
-# Adapted from https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/modeling_intern_vit.py
-register_chat_template(
-    ChatTemplate(
-        name="internvl-2-5",
-        default_system_prompt="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
-        role_prefix_and_suffix={
-            "system": ("<|im_start|>system\n", "<|im_end|>\n"),
-            "user": ("<|im_start|>user\n", "<|im_end|>\n"),
-            "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
-        },
-        stop_str=["<|im_end|>", "<|action_end|>"],
-    )
-)
-
 register_chat_template(
     ChatTemplate(
         name="granite-3-instruct",
@@ -495,16 +419,10 @@ register_chat_template(
 
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
-    if re.search(r"deepseek-(v3|r1)", model_path, re.IGNORECASE) and not re.search(
-        r"base", model_path, re.IGNORECASE
-    ):
-        return "deepseek-v3"
-
-
-@register_chat_template_matching_function
-def match_deepseek_janus_pro(model_path: str):
-    if re.search(r"janus", model_path, re.IGNORECASE):
-        return "janus-pro"
+    if (
+        "deepseek-v3" in model_path.lower() or "deepseek-r1" in model_path.lower()
+    ) and "base" not in model_path.lower():
+        return get_chat_template("deepseek-v3")
 
 
 @register_chat_template_matching_function
@@ -607,6 +525,16 @@ def match_gemma3_instruct(model_path: str):
 def match_internvl_chat(model_path: str):
     if re.search(r"internvl2_5", model_path, re.IGNORECASE):
         return "internvl-2-5"
+
+
+@register_chat_template_matching_function
+def match_granite_instruct(model_path: str):
+    model_path = model_path.lower()
+    # When future versions of Granite are released, this code may
+    # need to be updated. For now, assume that the Granite 3.0
+    # template works across the board.
+    if "granite" in model_path and "instruct" in model_path:
+        return get_chat_template("granite-3-instruct")
 
 
 if __name__ == "__main__":
