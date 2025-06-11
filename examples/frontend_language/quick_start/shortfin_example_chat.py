@@ -19,9 +19,9 @@ import sglang as sgl
 def multi_turn_question(s, question_1, question_2):
     s += sgl.system("You are a helpful assistant.")
     s += sgl.user(question_1)
-    s += sgl.assistant(sgl.gen("answer_1", max_tokens=256))
+    s += sgl.assistant(sgl.gen("answer_1", max_tokens=256, top_p=0.95))
     s += sgl.user(question_2)
-    s += sgl.assistant(sgl.gen("answer_2", max_tokens=256))
+    s += sgl.assistant(sgl.gen("answer_2", max_tokens=256, top_p=0.95))
 
 
 @sgl.function

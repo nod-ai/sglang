@@ -131,6 +131,18 @@ class SglSamplingParams:
             "max_completion_tokens": self.max_new_tokens,
             "temperature": self.temperature,
         }
+
+        top_p = self.top_p
+        if top_p == 1.0:
+            top_p = None
+
+        top_k = self.top_k
+        if top_k == -1:
+            top_k = None
+
+        kwargs["sampling_params"]["top_p"] = top_p
+        kwargs["sampling_params"]["top_k"] = top_k
+
         return kwargs
 
     def to_srt_kwargs(self):
