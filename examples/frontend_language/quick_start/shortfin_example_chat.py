@@ -2,9 +2,9 @@
 Usage:
 # Prior to running this script, you need to have a Shortfin server running.
 # Build:
-#   https://github.com/nod-ai/SHARK-Platform/blob/main/shortfin/README.md
+#   https://github.com/nod-ai/AMD-SHARK-Platform/blob/main/shortfin/README.md
 # Run:
-#   https://github.com/nod-ai/SHARK-Platform/blob/main/shortfin/python/shortfin_apps/llm/README.md
+#   https://github.com/nod-ai/AMD-SHARK-Platform/blob/main/shortfin/python/shortfin_apps/llm/README.md
 
 python3 shortfin_example_chat.py --base_url <url_to_shortfin_server>
 """
